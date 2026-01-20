@@ -26,10 +26,12 @@ namespace Moretoways
         private bool isRunning = true;
         private Dictionary<Vector2Int, TileModel> cachedTiles = new Dictionary<Vector2Int, TileModel>();
         private readonly object cacheLock = new object();
+        private static Moretoways pluginInstance;
 
         void Start()
         {
             Debug.Log("Unity: start");
+            pluginInstance = this;
             Logger.LogInfo("hello");
             Harmony.CreateAndPatchAll(typeof(Moretoways));
 
@@ -105,18 +107,22 @@ namespace Moretoways
                 {
                     case "/":
                     case "/tiles":
+                        Debug.Log("Access /tiles");
                         responseString = GetAllTilesJson();
                         break;
 
                     case "/tiles/count":
+                        Debug.Log("Access /tiles/count");
                         responseString = GetTilesCountJson();
                         break;
 
                     case "/destinations":
+                        Debug.Log("Access /destinations");
                         responseString = GetDestinationsJson();
                         break;
 
                     case "/game/status":
+                        Debug.Log("Access /game/status");
                         responseString = GetGameStatusJson();
                         break;
 
@@ -150,13 +156,13 @@ namespace Moretoways
                     var tileData = new
                     {
                         coordinates = new { x = kvp.Key.x, y = kvp.Key.y },
-                        worldPosition = TilemapView.GetWorldPositionForCoordinates(kvp.Key),
-                        screenPosition = Camera.main != null ?
-                            (object)new
-                            {
-                                x = Camera.main.WorldToScreenPoint(TilemapView.GetWorldPositionForCoordinates(kvp.Key)).x,
-                                y = Camera.main.WorldToScreenPoint(TilemapView.GetWorldPositionForCoordinates(kvp.Key)).y
-                            } : null,
+                        //worldPosition = TilemapView.GetWorldPositionForCoordinates(kvp.Key),
+                        //screenPosition = Camera.main != null ?
+                        //    (object)new
+                        //    {
+                        //        x = Camera.main.WorldToScreenPoint(TilemapView.GetWorldPositionForCoordinates(kvp.Key)).x,
+                        //        y = Camera.main.WorldToScreenPoint(TilemapView.GetWorldPositionForCoordinates(kvp.Key)).y
+                        //    } : null,
                         contentType = tile.Tile.ContentType.ToString(),
                         contentData = GetContentData(tile)
                     };
@@ -205,6 +211,7 @@ namespace Moretoways
 
         private string GetTilesCountJson()
         {
+            Debug.Log(cachedTiles);
             lock (cacheLock)
             {
                 return Newtonsoft.Json.JsonConvert.SerializeObject(new
@@ -221,11 +228,11 @@ namespace Moretoways
             lock (cacheLock)
             {
                 var destinations = new List<object>();
-
+                
                 foreach (var kvp in cachedTiles)
                 {
                     var tile = kvp.Value;
-                    if (tile.Tile.ContentType == TileContentType.Destination && tile.Tile.ContentModel != null)
+                    //if (tile.Tile.ContentType == TileContentType.Destination && tile.Tile.ContentModel != null)
                     {
                         try
                         {
@@ -233,8 +240,8 @@ namespace Moretoways
                             destinations.Add(new
                             {
                                 coordinates = new { x = kvp.Key.x, y = kvp.Key.y },
-                                groupIndex = destination.GroupIndex,
-                                worldPosition = TilemapView.GetWorldPositionForCoordinates(kvp.Key)
+                                //groupIndex = destination.GroupIndex,
+                                //worldPosition = TilemapView.GetWorldPositionForCoordinates(kvp.Key)
                             });
                         }
                         catch (Exception e)
@@ -314,10 +321,16 @@ namespace Moretoways
                 if (tilesDict != null)
                 {
                     // 更新缓存
-                    var pluginInstance = UnityEngine.Object.FindObjectOfType<Moretoways>();
+                    
                     if (pluginInstance != null)
                     {
                         pluginInstance.UpdateTileCache(tilesDict);
+                        //foreach (var kvp in pluginInstance.cachedTiles)
+                        //{
+                        //    Debug.Log(kvp.Key);
+                        //    Debug.Log(kvp.Value);
+                        //}
+                        
                     }
 
                     // 原有的调试输出代码...
