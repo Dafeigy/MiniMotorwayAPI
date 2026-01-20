@@ -92,16 +92,16 @@ namespace Moretoways
                     {
                         //Debug.Log(kvp.Key); // Vector2Int
                         
-                        var tilemodel = __instance.GetTile(kvp.Key);
+                        Tile tile = __instance.GetTile(kvp.Key);
                         //Debug.Log(tilemodel); // TileModel
-                        Debug.Log(tilemodel.Coordinates);
-                        Debug.Log(tilemodel.ContentType);
-                        Debug.Log(tilemodel.ContentModel);
+                        Debug.Log(tile.Coordinates);
+                        Debug.Log(tile.ContentType);
+                        Debug.Log(tile.ContentModel);
                         try
                         {
-                            if (tilemodel.ContentType == TileContentType.Destination)
+                            if (tile.ContentType == TileContentType.Destination)
                             {
-                                var destion = (DestinationModel)tilemodel.ContentModel;
+                                var destion = (DestinationModel)tile.ContentModel;
                                 Debug.Log(destion.GroupIndex);
                             }
                         }
