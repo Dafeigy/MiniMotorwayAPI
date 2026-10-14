@@ -38,6 +38,10 @@
     <Reference Include="App">
       <HintPath>F:\SteamLibrary\steamapps\common\Mini Motorways\Mini Motorways_Data\Managed\App.dll</HintPath>
     </Reference>
+    <Reference Include="FixedMath">
+      <HintPath>F:\SteamLibrary\steamapps\common\Mini Motorways\Mini Motorways_Data\Managed\FixedMath.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
     <Reference Include="BepInEx.Core">
       <HintPath>F:\SteamLibrary\steamapps\common\Mini Motorways\BepInEx\core\BepInEx.Core.dll</HintPath>
       <Private>False</Private>

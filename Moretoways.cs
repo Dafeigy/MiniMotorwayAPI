@@ -1,364 +1,604 @@
-﻿using BepInEx;
+using BepInEx;
 using BepInEx.Unity.Mono;
 using HarmonyLib;
 using Motorways;
-using Motorways.Actions;
+using Motorways.Commands;
 using Motorways.Models;
 using Motorways.Views;
+using Newtonsoft.Json;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Linq;
-using System.Reflection;
+using System.IO;
+using System.Net;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using UnityEngine;
-using System.Net;
-using System.IO;
-using System.Threading;
 
 namespace Moretoways
 {
     [BepInPlugin("Nul4i.motoways.plugin", "Moretoways", "1.0.0")]
     public class Moretoways : BaseUnityPlugin
     {
+        private const int Port = 9000;
+        private const int RequestTimeoutMs = 5000;
+
+        private readonly ConcurrentQueue<SnapshotRequest> requests = new ConcurrentQueue<SnapshotRequest>();
         private HttpListener httpListener;
         private Thread httpThread;
-        private bool isRunning = true;
-        private Dictionary<Vector2Int, TileModel> cachedTiles = new Dictionary<Vector2Int, TileModel>();
-        private readonly object cacheLock = new object();
+        private volatile bool isRunning;
+        private TilemapModel tilemap;
+        private long snapshotId;
+        private int editCommandsExecuted;
+        private int lastScore;
         private static Moretoways pluginInstance;
 
-        void Start()
+        private sealed class SnapshotRequest
         {
-            Debug.Log("Unity: start");
-            pluginInstance = this;
-            Logger.LogInfo("hello");
-            Harmony.CreateAndPatchAll(typeof(Moretoways));
+            public readonly string Path;
+            public readonly string Body;
+            public readonly TaskCompletionSource<ApiResponse> Completion =
+                new TaskCompletionSource<ApiResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
 
-            // 启动HTTP服务器
+            public SnapshotRequest(string path, string body)
+            {
+                Path = path;
+                Body = body;
+            }
+        }
+
+        private sealed class RoadRequest
+        {
+            public int? x { get; set; }
+            public int? y { get; set; }
+            public string direction { get; set; }
+        }
+
+        private sealed class ClearRequest
+        {
+            public int? x { get; set; }
+            public int? y { get; set; }
+        }
+
+        private sealed class ApiResponse
+        {
+            public readonly int StatusCode;
+            public readonly string Json;
+
+            public ApiResponse(int statusCode, string json)
+            {
+                StatusCode = statusCode;
+                Json = json;
+            }
+        }
+
+        private sealed class TileSnapshot
+        {
+            public object coordinates;
+            public string contentType;
+            public string buildingId;
+            public object contentData;
+            public Dictionary<string, string> roads;
+            public bool hasTrafficLight;
+            public bool isRoundabout;
+            public string drivewayDirection;
+            public int unbuiltMotorwayId;
+        }
+
+        private sealed class GameSnapshot
+        {
+            public bool success = true;
+            public long snapshotId;
+            public int editCommandsExecuted;
+            public DateTime timestamp;
+            public string phase;
+            public bool gameUI;
+            public bool tilemapView;
+            public bool camera;
+            public string timeScaleMode;
+            public int? score;
+            public object clock;
+            public object resources;
+            public int tileCount;
+            public List<TileSnapshot> tiles = new List<TileSnapshot>();
+        }
+
+        private void Start()
+        {
+            pluginInstance = this;
+            Harmony.CreateAndPatchAll(typeof(Moretoways));
             StartHttpServer();
+            Logger.LogInfo("Moretoways API started");
         }
 
         private void StartHttpServer()
         {
             try
             {
-                // 创建HTTP监听器，监听本地9000端口
                 httpListener = new HttpListener();
-                httpListener.Prefixes.Add("http://localhost:9000/");
+                httpListener.Prefixes.Add("http://localhost:" + Port + "/");
                 httpListener.Start();
-
-                Debug.Log("RESTful服务已启动，地址: http://localhost:9000/");
-
-                // 在后台线程运行HTTP服务器
-                httpThread = new Thread(ListenForRequests);
-                httpThread.IsBackground = true;
+                isRunning = true;
+                httpThread = new Thread(ListenForRequests) { IsBackground = true };
                 httpThread.Start();
             }
-            catch (Exception e)
+            catch (Exception exception)
             {
-                Debug.LogError($"启动HTTP服务器失败: {e.Message}");
+                Logger.LogError("Could not start HTTP server: " + exception);
+                httpListener?.Close();
             }
         }
 
         private void ListenForRequests()
         {
-            while (isRunning && httpListener != null && httpListener.IsListening)
+            while (isRunning)
             {
                 try
                 {
-                    // 异步等待请求
-                    var context = httpListener.GetContext();
-                    ProcessRequest(context);
+                    ProcessRequest(httpListener.GetContext());
                 }
-                catch (Exception e)
+                catch (HttpListenerException)
                 {
                     if (isRunning)
-                        Debug.LogError($"HTTP请求处理错误: {e.Message}");
+                        Logger.LogError("HTTP listener stopped unexpectedly");
+                }
+                catch (ObjectDisposedException)
+                {
+                    if (isRunning)
+                        Logger.LogError("HTTP listener disposed unexpectedly");
+                }
+                catch (Exception exception)
+                {
+                    if (isRunning)
+                        Logger.LogError("HTTP listener error: " + exception);
                 }
             }
         }
 
         private void ProcessRequest(HttpListenerContext context)
         {
+            var response = context.Response;
             try
             {
-                var request = context.Request;
-                var response = context.Response;
-
-                // 设置CORS头
-                response.Headers.Add("Access-Control-Allow-Origin", "*");
-                response.Headers.Add("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-                response.Headers.Add("Access-Control-Allow-Headers", "Content-Type");
-
-                // 处理预检请求
-                if (request.HttpMethod == "OPTIONS")
+                string path = context.Request.Url.AbsolutePath;
+                bool isAction = path == "/actions/road" || path == "/actions/clear" ||
+                    path == "/game/restart";
+                if (context.Request.HttpMethod != (isAction ? "POST" : "GET"))
                 {
-                    response.StatusCode = 200;
-                    response.Close();
+                    SendJson(response, 405, "{\"error\":\"Method Not Allowed\"}");
                     return;
                 }
 
-                string responseString = "";
-                response.ContentType = "application/json";
-
-                // 根据请求路径路由到不同的处理函数
-                switch (request.Url.AbsolutePath)
+                if (path != "/" && path != "/snapshot" && path != "/tiles" &&
+                    path != "/tiles/count" && path != "/destinations" &&
+                    path != "/game/status" && !isAction)
                 {
-                    case "/":
-                    case "/tiles":
-                        Debug.Log("Access /tiles");
-                        responseString = GetAllTilesJson();
-                        break;
-
-                    case "/tiles/count":
-                        Debug.Log("Access /tiles/count");
-                        responseString = GetTilesCountJson();
-                        break;
-
-                    case "/destinations":
-                        Debug.Log("Access /destinations");
-                        responseString = GetDestinationsJson();
-                        break;
-
-                    case "/game/status":
-                        Debug.Log("Access /game/status");
-                        responseString = GetGameStatusJson();
-                        break;
-
-                    default:
-                        response.StatusCode = 404;
-                        responseString = "{\"error\": \"Not Found\"}";
-                        break;
+                    SendJson(response, 404, "{\"error\":\"Not Found\"}");
+                    return;
                 }
 
-                // 发送响应
-                byte[] buffer = Encoding.UTF8.GetBytes(responseString);
-                response.ContentLength64 = buffer.Length;
-                response.OutputStream.Write(buffer, 0, buffer.Length);
-                response.OutputStream.Close();
-            }
-            catch (Exception e)
-            {
-                Debug.LogError($"处理HTTP请求时出错: {e}");
-            }
-        }
-
-        private string GetAllTilesJson()
-        {
-            lock (cacheLock)
-            {
-                var tilesList = new List<object>();
-
-                foreach (var kvp in cachedTiles)
+                string body = null;
+                if (path == "/actions/road" || path == "/actions/clear")
                 {
-                    var tile = kvp.Value;
-                    var tileData = new
+                    if (context.Request.ContentLength64 > 4096)
                     {
-                        coordinates = new { x = kvp.Key.x, y = kvp.Key.y },
-                        //worldPosition = TilemapView.GetWorldPositionForCoordinates(kvp.Key),
-                        //screenPosition = Camera.main != null ?
-                        //    (object)new
-                        //    {
-                        //        x = Camera.main.WorldToScreenPoint(TilemapView.GetWorldPositionForCoordinates(kvp.Key)).x,
-                        //        y = Camera.main.WorldToScreenPoint(TilemapView.GetWorldPositionForCoordinates(kvp.Key)).y
-                        //    } : null,
-                        contentType = tile.Tile.ContentType.ToString(),
-                        contentData = GetContentData(tile)
-                    };
-
-                    tilesList.Add(tileData);
-                }
-
-                return Newtonsoft.Json.JsonConvert.SerializeObject(new
-                {
-                    success = true,
-                    count = tilesList.Count,
-                    tiles = tilesList,
-                    timestamp = DateTime.UtcNow
-                });
-            }
-        }
-
-        private object GetContentData(TileModel tile)
-        {
-            if (tile.Tile.ContentModel == null)
-                return null;
-
-            try
-            {
-                if (tile.Tile.ContentType == TileContentType.Destination)
-                {
-                    var destination = (DestinationModel)tile.Tile.ContentModel;
-                    return new
+                        SendJson(response, 413, "{\"error\":\"Request body too large\"}");
+                        return;
+                    }
+                    using (var reader = new StreamReader(context.Request.InputStream, Encoding.UTF8))
+                        body = reader.ReadToEnd();
+                    if (body.Length > 4096)
                     {
-                        groupIndex = destination.GroupIndex,
-                        type = "Destination"
-                    };
-                }
-                // 可以添加其他类型的处理
-                else
-                {
-                    return new { type = tile.Tile.ContentType.ToString() };
-                }
-            }
-            catch (Exception e)
-            {
-                Debug.LogWarning($"获取ContentData时出错: {e.Message}");
-                return new { error = e.Message };
-            }
-        }
-
-        private string GetTilesCountJson()
-        {
-            Debug.Log(cachedTiles);
-            lock (cacheLock)
-            {
-                return Newtonsoft.Json.JsonConvert.SerializeObject(new
-                {
-                    success = true,
-                    count = cachedTiles.Count,
-                    timestamp = DateTime.UtcNow
-                });
-            }
-        }
-
-        private string GetDestinationsJson()
-        {
-            lock (cacheLock)
-            {
-                var destinations = new List<object>();
-                
-                foreach (var kvp in cachedTiles)
-                {
-                    var tile = kvp.Value;
-                    //if (tile.Tile.ContentType == TileContentType.Destination && tile.Tile.ContentModel != null)
-                    {
-                        try
-                        {
-                            var destination = (DestinationModel)tile.Tile.ContentModel;
-                            destinations.Add(new
-                            {
-                                coordinates = new { x = kvp.Key.x, y = kvp.Key.y },
-                                //groupIndex = destination.GroupIndex,
-                                //worldPosition = TilemapView.GetWorldPositionForCoordinates(kvp.Key)
-                            });
-                        }
-                        catch (Exception e)
-                        {
-                            Debug.LogWarning($"处理目的地数据时出错: {e.Message}");
-                        }
+                        SendJson(response, 413, "{\"error\":\"Request body too large\"}");
+                        return;
                     }
                 }
 
-                return Newtonsoft.Json.JsonConvert.SerializeObject(new
+                var request = new SnapshotRequest(path, body);
+                requests.Enqueue(request);
+                if (!request.Completion.Task.Wait(RequestTimeoutMs))
                 {
-                    success = true,
-                    count = destinations.Count,
-                    destinations = destinations,
-                    timestamp = DateTime.UtcNow
-                });
+                    SendJson(response, 503, "{\"error\":\"Game main thread did not respond\"}");
+                    return;
+                }
+
+                ApiResponse result = request.Completion.Task.Result;
+                SendJson(response, result.StatusCode, result.Json);
+            }
+            catch (Exception exception)
+            {
+                Logger.LogError("HTTP request failed: " + exception);
+                try
+                {
+                    SendJson(response, 500, "{\"error\":\"Internal Server Error\"}");
+                }
+                catch (Exception) { }
+            }
+            finally
+            {
+                response.Close();
             }
         }
 
-        private string GetGameStatusJson()
+        private static void SendJson(HttpListenerResponse response, int statusCode, string json)
         {
-            var inGameUI = UnityEngine.Object.FindObjectOfType(typeof(GameUIScreen));
-            var inGameTilemapView = UnityEngine.Object.FindObjectOfType(typeof(TilemapView));
-
-            return Newtonsoft.Json.JsonConvert.SerializeObject(new
-            {
-                success = true,
-                gameUI = inGameUI != null,
-                tilemapView = inGameTilemapView != null,
-                camera = Camera.main != null,
-                tileCount = cachedTiles.Count,
-                timestamp = DateTime.UtcNow
-            });
+            byte[] bytes = Encoding.UTF8.GetBytes(json);
+            response.StatusCode = statusCode;
+            response.ContentType = "application/json; charset=utf-8";
+            response.ContentLength64 = bytes.Length;
+            response.OutputStream.Write(bytes, 0, bytes.Length);
         }
 
-        // 更新缓存方法
-        private void UpdateTileCache(Dictionary<Vector2Int, TileModel> tilesDict)
+        private void Update()
         {
-            lock (cacheLock)
+            SnapshotRequest request;
+            if (!requests.TryDequeue(out request))
+                return;
+
+            try
             {
-                cachedTiles.Clear();
-                foreach (var kvp in tilesDict)
+                // Game objects are copied on Unity's main thread. The HTTP thread
+                // receives JSON only and never accesses a live game object.
+                if (request.Path == "/actions/road")
+                    request.Completion.TrySetResult(AddRoad(request.Body));
+                else if (request.Path == "/actions/clear")
+                    request.Completion.TrySetResult(ClearRoads(request.Body));
+                else if (request.Path == "/game/restart")
+                    request.Completion.TrySetResult(RestartGame());
+                else
                 {
-                    cachedTiles[kvp.Key] = kvp.Value;
+                    GameSnapshot snapshot = CaptureSnapshot();
+                    request.Completion.TrySetResult(new ApiResponse(200, SerializeResponse(snapshot, request.Path)));
                 }
+            }
+            catch (Exception exception)
+            {
+                Logger.LogError("Snapshot failed: " + exception);
+                request.Completion.TrySetResult(new ApiResponse(500,
+                    "{\"success\":false,\"error\":\"Snapshot failed\"}"));
+            }
+        }
+
+        private ApiResponse AddRoad(string body)
+        {
+            RoadRequest input;
+            try
+            {
+                input = JsonConvert.DeserializeObject<RoadRequest>(body);
+            }
+            catch (JsonException)
+            {
+                return new ApiResponse(400, "{\"success\":false,\"error\":\"Invalid JSON\"}");
+            }
+
+            TileDirection direction;
+            if (input == null || !input.x.HasValue || !input.y.HasValue ||
+                !Enum.TryParse(input.direction, true, out direction) ||
+                direction == TileDirection.None || (int)direction < 0 || (int)direction > 7)
+            {
+                return new ApiResponse(400,
+                    "{\"success\":false,\"error\":\"Expected x, y and a compass direction\"}");
+            }
+
+            return ApplyTileEdit((editor, view) =>
+                editor.AddRoad(view, new Vector2Int(input.x.Value, input.y.Value), direction));
+        }
+
+        private ApiResponse ClearRoads(string body)
+        {
+            ClearRequest input;
+            try
+            {
+                input = JsonConvert.DeserializeObject<ClearRequest>(body);
+            }
+            catch (JsonException)
+            {
+                return new ApiResponse(400, "{\"success\":false,\"error\":\"Invalid JSON\"}");
+            }
+
+            if (input == null || !input.x.HasValue || !input.y.HasValue)
+                return new ApiResponse(400, "{\"success\":false,\"error\":\"Expected x and y\"}");
+
+            return ApplyTileEdit((editor, view) => editor.ClearTileExplicit(
+                view, new Vector2Int(input.x.Value, input.y.Value),
+                TileEditor.ClearTileOfType.Roads,
+                Tile.TileChangePermissions.RespectPermanence));
+        }
+
+        private ApiResponse ApplyTileEdit(Func<TileEditor, TilemapView, TileEditResult> createEdit)
+        {
+            var gameUI = UnityEngine.Object.FindObjectOfType<GameUIScreen>();
+            var tilemapView = gameUI == null ? null :
+                Traverse.Create(gameUI).Field("_tilemapView").GetValue<TilemapView>();
+            if (gameUI == null || tilemapView == null)
+                return new ApiResponse(409, "{\"success\":false,\"error\":\"No active game\"}");
+
+            var scope = Traverse.Create(tilemapView).Field("_scope").GetValue<Factory.IScope>();
+            var simulation = Traverse.Create(tilemapView).Field("_simulation").GetValue<Server.ISimulation>();
+            if (scope == null || simulation == null)
+                return new ApiResponse(503,
+                    "{\"success\":false,\"error\":\"Game action services are unavailable\"}");
+
+            TileEditor editor = scope.Get<TileEditor>();
+            ClientUpgradeDatabase clientUpgrades = scope.Get<ClientUpgradeDatabase>();
+            if (editor == null || clientUpgrades == null)
+                return new ApiResponse(503,
+                    "{\"success\":false,\"error\":\"Game edit services are unavailable\"}");
+
+            TileEditResult result = createEdit(editor, tilemapView);
+            if (!result.IsSuccessful)
+                return new ApiResponse(422, JsonConvert.SerializeObject(new
+                {
+                    success = false,
+                    resultCode = result.resultCode.ToString(),
+                    errorPosition = new { x = result.errorPosition.x, y = result.errorPosition.y }
+                }));
+
+            if (result.edit == null)
+                return new ApiResponse(200, "{\"success\":true,\"scheduled\":false,\"resultCode\":\"NoChange\"}");
+
+            // Match MotorwaysPlayerAction.AddTileEdit(Immediate): add the client
+            // edit to the tile views, schedule the simulation command, then
+            // track the pending edit in the client upgrade database.
+            ClientTileEdit clientEdit = tilemapView.GenerateClientTileEditAndAddEditToViews(result.edit, false);
+            bool scheduled = simulation.ScheduleCommand(EditTileCommand.Create(scope, result.edit));
+            clientEdit.isScheduledOnSimulation = scheduled;
+            if (scheduled)
+                clientUpgrades.AddTileEdit(clientEdit);
+            return new ApiResponse(scheduled ? 202 : 409, JsonConvert.SerializeObject(new
+            {
+                success = scheduled,
+                scheduled = scheduled,
+                resultCode = scheduled ? "Scheduled" : "ScheduleRejected"
+            }));
+        }
+
+        private ApiResponse RestartGame()
+        {
+            var gameOver = UnityEngine.Object.FindObjectOfType<GameOverScreen>();
+            if (gameOver == null)
+                return new ApiResponse(409,
+                    "{\"success\":false,\"error\":\"Restart is only available on the game-over screen\"}");
+
+            gameOver.OnRestart();
+            tilemap = null;
+            return new ApiResponse(202, "{\"success\":true,\"resultCode\":\"RestartRequested\"}");
+        }
+
+        private GameSnapshot CaptureSnapshot()
+        {
+            var gameUI = UnityEngine.Object.FindObjectOfType<GameUIScreen>();
+            var gameOverUI = UnityEngine.Object.FindObjectOfType<GameOverScreen>();
+            var tilemapView = gameUI == null ? null :
+                Traverse.Create(gameUI).Field("_tilemapView").GetValue<TilemapView>();
+            var snapshot = new GameSnapshot
+            {
+                snapshotId = ++snapshotId,
+                editCommandsExecuted = this.editCommandsExecuted,
+                timestamp = DateTime.UtcNow,
+                phase = gameOverUI != null ? "gameOver" : gameUI != null ? "playing" : "menu",
+                gameUI = gameUI != null,
+                tilemapView = tilemapView != null,
+                camera = Camera.main != null,
+                timeScaleMode = gameUI == null ? null : gameUI.GetTimeScaleMode().ToString()
+            };
+
+            if (gameUI == null)
+            {
+                tilemap = null;
+                if (gameOverUI != null)
+                    snapshot.score = lastScore;
+                return snapshot;
+            }
+
+            // The view's model is the current game's tilemap. The Harmony hook
+            // remains a fallback for frames in which the view has not bound yet.
+            if (tilemapView != null)
+            {
+                var currentTilemap = Traverse.Create(tilemapView).Field("_tilemapModel").GetValue<TilemapModel>();
+                if (currentTilemap != null)
+                    tilemap = currentTilemap;
+            }
+
+            var scoreModel = Traverse.Create(gameUI).Field("_scoreModel").GetValue<ScoreModel>();
+            if (scoreModel != null)
+            {
+                snapshot.score = scoreModel.Score;
+                lastScore = scoreModel.Score;
+            }
+
+            var clockView = Traverse.Create(gameUI).Field("_clockView").GetValue<ClockView>();
+            var clock = clockView != null ? clockView.ClockModel : null;
+            if (clock != null)
+                snapshot.clock = new { time = (double)clock.Time, hour = clock.Hour, day = clock.Day, week = clock.Week };
+
+            var upgrades = Traverse.Create(gameUI).Field("_upgradeDatabaseModel").GetValue<UpgradeDatabaseModel>();
+            if (upgrades != null)
+            {
+                var available = new Dictionary<string, int>();
+                foreach (UpgradeType type in Enum.GetValues(typeof(UpgradeType)))
+                {
+                    if (type != UpgradeType.Count)
+                        available[type.ToString()] = upgrades.GetAvailableUpgradeCount(type);
+                }
+                snapshot.resources = available;
+            }
+
+            if (tilemap != null)
+            {
+                var tiles = Traverse.Create(tilemap).Field("_tiles")
+                    .GetValue<Dictionary<Vector2Int, TileModel>>();
+                if (tiles != null)
+                {
+                    foreach (var entry in tiles)
+                    {
+                        if (entry.Value != null && entry.Value.Tile != null)
+                            snapshot.tiles.Add(CaptureTile(entry.Key, entry.Value.Tile));
+                    }
+                }
+            }
+
+            snapshot.tileCount = snapshot.tiles.Count;
+            return snapshot;
+        }
+
+        private static TileSnapshot CaptureTile(Vector2Int coordinates, Tile tile)
+        {
+            var roads = new Dictionary<string, string>();
+            for (int directionIndex = 0; directionIndex < 8; directionIndex++)
+            {
+                var direction = (TileDirection)directionIndex;
+                var state = tile.StateOfRoadInDirection(direction);
+                if (state != RoadState.None)
+                    roads[direction.ToString()] = state.ToString();
+            }
+
+            object contentData = null;
+            string buildingId = null;
+            if (tile.ContentType == TileContentType.House && tile.ContentModel is HouseModel house)
+            {
+                buildingId = "H:" + coordinates.x + ":" + coordinates.y;
+                contentData = new { groupIndex = house.GroupIndex, hasWaitingVehicle = house.HasWaitingVehicle };
+            }
+            else if (tile.ContentType == TileContentType.Destination &&
+                     tile.ContentModel is DestinationModel destination)
+            {
+                int minX = coordinates.x;
+                int minY = coordinates.y;
+                var footprint = new List<object>();
+                if (destination.TileModels != null)
+                {
+                    foreach (TileModel footprintTile in destination.TileModels)
+                    {
+                        if (footprintTile == null)
+                            continue;
+                        Vector2Int position = footprintTile.Coordinates;
+                        minX = Math.Min(minX, position.x);
+                        minY = Math.Min(minY, position.y);
+                        footprint.Add(new { x = position.x, y = position.y });
+                    }
+                }
+                buildingId = "D:" + minX + ":" + minY;
+                var carpark = destination.Carpark;
+                bool hasTopLeftEntrance = carpark != null &&
+                    Traverse.Create(carpark).Field("entranceAtTopLeft").GetValue<bool>();
+                bool hasBottomRightEntrance = carpark != null &&
+                    Traverse.Create(carpark).Field("entranceAtBottomRight").GetValue<bool>();
+                contentData = new
+                {
+                    groupIndex = destination.GroupIndex,
+                    totalDemand = destination.TotalDemand,
+                    isOvercrowding = destination.IsOvercrowding,
+                    isUpgraded = destination.IsUpgraded,
+                    footprint = footprint,
+                    carpark = carpark == null ? null : new
+                    {
+                        topLeft = new { x = carpark.TopLeftWorldCoordinate.x, y = carpark.TopLeftWorldCoordinate.y },
+                        drivewayTopLeft = hasTopLeftEntrance
+                            ? (object)new { x = carpark.TopLeftDrivewayTileCoordinates.x, y = carpark.TopLeftDrivewayTileCoordinates.y }
+                            : null,
+                        drivewayBottomRight = hasBottomRightEntrance
+                            ? (object)new { x = carpark.BottomRightDrivewayTileCoordinates.x, y = carpark.BottomRightDrivewayTileCoordinates.y }
+                            : null
+                    }
+                };
+            }
+
+            return new TileSnapshot
+            {
+                coordinates = new { x = coordinates.x, y = coordinates.y },
+                contentType = tile.ContentType.ToString(),
+                buildingId = buildingId,
+                contentData = contentData,
+                roads = roads,
+                hasTrafficLight = tile.HasTrafficLight,
+                isRoundabout = tile.IsCenterOfRoundabout,
+                drivewayDirection = tile.DrivewayDirection.ToString(),
+                unbuiltMotorwayId = tile.UnbuiltMotorwayId
+            };
+        }
+
+        private static string SerializeResponse(GameSnapshot snapshot, string path)
+        {
+            switch (path)
+            {
+                case "/":
+                case "/snapshot":
+                    return JsonConvert.SerializeObject(snapshot);
+                case "/tiles":
+                    return JsonConvert.SerializeObject(new
+                    {
+                        success = true, snapshotId = snapshot.snapshotId,
+                        count = snapshot.tileCount, tiles = snapshot.tiles, timestamp = snapshot.timestamp
+                    });
+                case "/tiles/count":
+                    return JsonConvert.SerializeObject(new
+                    {
+                        success = true, snapshotId = snapshot.snapshotId,
+                        count = snapshot.tileCount, timestamp = snapshot.timestamp
+                    });
+                case "/destinations":
+                    var seen = new HashSet<string>();
+                    var destinations = snapshot.tiles.FindAll(tile =>
+                        tile.contentType == "Destination" &&
+                        tile.buildingId != null && seen.Add(tile.buildingId));
+                    return JsonConvert.SerializeObject(new
+                    {
+                        success = true, snapshotId = snapshot.snapshotId,
+                        count = destinations.Count, destinations = destinations, timestamp = snapshot.timestamp
+                    });
+                case "/game/status":
+                    return JsonConvert.SerializeObject(new
+                    {
+                        success = true, snapshotId = snapshot.snapshotId,
+                        editCommandsExecuted = snapshot.editCommandsExecuted,
+                        phase = snapshot.phase, gameUI = snapshot.gameUI,
+                        tilemapView = snapshot.tilemapView, camera = snapshot.camera,
+                        timeScaleMode = snapshot.timeScaleMode,
+                        tileCount = snapshot.tileCount, score = snapshot.score,
+                        clock = snapshot.clock, resources = snapshot.resources,
+                        timestamp = snapshot.timestamp
+                    });
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(path));
             }
         }
 
         private void OnDestroy()
         {
-            // 清理资源
             isRunning = false;
-
-            if (httpListener != null && httpListener.IsListening)
-            {
-                httpListener.Stop();
-                httpListener.Close();
-            }
-
+            httpListener?.Close();
             if (httpThread != null && httpThread.IsAlive)
-            {
                 httpThread.Join(1000);
-            }
 
-            Debug.Log("RESTful服务已停止");
+            SnapshotRequest request;
+            while (requests.TryDequeue(out request))
+                request.Completion.TrySetResult(new ApiResponse(503,
+                    "{\"success\":false,\"error\":\"Plugin stopped\"}"));
+
+            pluginInstance = null;
         }
 
-        // Harmony补丁部分保持不变，但更新缓存
-        [HarmonyPostfix, HarmonyPatch(typeof(Motorways.Models.TilemapModel), "GetAllTileCoordinates")]
-        public static void MotorwaysModelsTilemapModel_GetAllTileCoordinates(Motorways.Models.TilemapModel __instance, ref IEnumerable<Vector2Int> __result)
+        [HarmonyPostfix, HarmonyPatch(typeof(TilemapModel), "GetAllTileCoordinates")]
+        private static void OnGetAllTileCoordinates(TilemapModel __instance)
         {
-            try
-            {
-                var traverse = Traverse.Create(__instance);
-                var tilesDict = traverse.Field("_tiles").GetValue<Dictionary<Vector2Int, TileModel>>();
-
-                if (tilesDict != null)
-                {
-                    // 更新缓存
-                    
-                    if (pluginInstance != null)
-                    {
-                        pluginInstance.UpdateTileCache(tilesDict);
-                        //foreach (var kvp in pluginInstance.cachedTiles)
-                        //{
-                        //    Debug.Log(kvp.Key);
-                        //    Debug.Log(kvp.Value);
-                        //}
-                        
-                    }
-
-                    // 原有的调试输出代码...
-                    foreach (var kvp in tilesDict)
-                    {
-                        var tilemodel = __instance.GetTile(kvp.Key);
-                        // ... 原有的调试代码
-                    }
-                }
-            }
-            catch (Exception e)
-            {
-                Debug.Log("Error: running getAllTileCoordinates.");
-            }
+            if (pluginInstance != null)
+                pluginInstance.tilemap = __instance;
         }
 
-        // 原有的其他方法保持不变...
-        static private MethodInfo setGridMethod;
-        private object uiInstance;
-
-        private void Awake()
+        [HarmonyPostfix, HarmonyPatch(typeof(TilemapModel), "Reset")]
+        private static void OnTilemapReset(TilemapModel __instance)
         {
-            // ... 原有代码
+            if (pluginInstance != null && pluginInstance.tilemap == __instance)
+                pluginInstance.tilemap = null;
         }
 
-        private void Update()
+        [HarmonyPrefix, HarmonyPatch(typeof(EditTileCommand), "Execute")]
+        private static void OnEditCommandExecute()
         {
-            // ... 原有代码
+            if (pluginInstance != null)
+                pluginInstance.editCommandsExecuted++;
         }
     }
 }
