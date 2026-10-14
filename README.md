@@ -17,6 +17,21 @@ dotnet msbuild Moretoways.csproj /t:Build /p:Configuration=Debug /p:OutputPath=b
 Copy the built `Moretoways.dll` and `Newtonsoft.Json.dll` into the game's
 `BepInEx/plugins` directory if Newtonsoft.Json is not already available there.
 
+## Grid visibility shortcut
+
+Press `Ctrl+M` during a game to toggle always-visible world grid mode. Either
+the left or right Ctrl key works. When enabled, the grid remains visible after
+the mouse button is released, and each visible tile is labelled with its
+`(x,y)` coordinate in semi-transparent text. The labels follow the tiles while
+the camera moves or zooms. Press `Ctrl+M` again to hide the labels, disable the
+mode immediately, and restore the game's original press-to-show,
+release-to-hide behavior.
+
+![Ctrl+M Grid Display with coordinates](imgs/ctrl+M-coordinates.png)
+
+The toggle is not saved to a configuration file. It defaults to disabled each
+time Mini Motorways starts.
+
 ## Read API
 
 The listener accepts requests on `localhost:9000`.

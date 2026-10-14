@@ -37,6 +37,11 @@ namespace Moretoways
         private int editCommandsExecuted;
         private int lastScore;
         private ulong? initialSimulationSeed;
+        private bool alwaysShowWorldGrid;
+        private GameUIScreen gridGameUI;
+        private TilemapView gridTilemapView;
+        private GUIStyle gridCoordinateStyle;
+        private GUIStyle gridCoordinateShadowStyle;
         private static Moretoways pluginInstance;
 
         private sealed class SnapshotRequest
@@ -238,6 +243,12 @@ namespace Moretoways
 
         private void Update()
         {
+            if (Input.GetKeyDown(KeyCode.M) &&
+                (Input.GetKey(KeyCode.LeftControl) || Input.GetKey(KeyCode.RightControl)))
+            {
+                ToggleWorldGridMode();
+            }
+
             SnapshotRequest request;
             if (!requests.TryDequeue(out request))
                 return;
@@ -264,6 +275,95 @@ namespace Moretoways
                 request.Completion.TrySetResult(new ApiResponse(500,
                     "{\"success\":false,\"error\":\"Snapshot failed\"}"));
             }
+        }
+
+        private void ToggleWorldGridMode()
+        {
+            alwaysShowWorldGrid = !alwaysShowWorldGrid;
+
+            var gameUI = GetGridGameUI();
+            if (gameUI != null)
+                gameUI.SetWorldGridActive(alwaysShowWorldGrid, TransitionStyle.Tween);
+
+            Logger.LogInfo("Always-show world grid: " +
+                (alwaysShowWorldGrid ? "enabled" : "disabled"));
+        }
+
+        private GameUIScreen GetGridGameUI()
+        {
+            if (gridGameUI == null)
+            {
+                gridGameUI = UnityEngine.Object.FindObjectOfType<GameUIScreen>();
+                gridTilemapView = null;
+            }
+
+            return gridGameUI;
+        }
+
+        private void OnGUI()
+        {
+            if (!alwaysShowWorldGrid || Event.current.type != EventType.Repaint)
+                return;
+
+            GameUIScreen gameUI = GetGridGameUI();
+            if (gameUI == null)
+                return;
+
+            if (gridTilemapView == null)
+            {
+                gridTilemapView = Traverse.Create(gameUI)
+                    .Field("_tilemapView").GetValue<TilemapView>();
+            }
+            if (gridTilemapView == null)
+                return;
+
+            TilemapModel currentTilemap = Traverse.Create(gridTilemapView)
+                .Field("_tilemapModel").GetValue<TilemapModel>();
+            if (currentTilemap == null)
+                return;
+
+            EnsureGridCoordinateStyles();
+            int fontSize = Mathf.Clamp(
+                Mathf.RoundToInt(gridTilemapView.ScreenDistanceBetweenTiles * 0.2f), 9, 16);
+            gridCoordinateStyle.fontSize = fontSize;
+            gridCoordinateShadowStyle.fontSize = fontSize;
+
+            const float labelWidth = 72f;
+            const float labelHeight = 22f;
+            foreach (Vector2Int coordinates in currentTilemap.GetAllTileCoordinates())
+            {
+                Vector2 screenPosition =
+                    gridTilemapView.GetScreenPositionFromTileCoordinates(coordinates);
+                float guiX = screenPosition.x - labelWidth * 0.5f;
+                float guiY = Screen.height - screenPosition.y - labelHeight * 0.5f;
+
+                if (guiX + labelWidth < 0f || guiX > Screen.width ||
+                    guiY + labelHeight < 0f || guiY > Screen.height)
+                {
+                    continue;
+                }
+
+                string label = "(" + coordinates.x + "," + coordinates.y + ")";
+                GUI.Label(new Rect(guiX + 1f, guiY + 1f, labelWidth, labelHeight),
+                    label, gridCoordinateShadowStyle);
+                GUI.Label(new Rect(guiX, guiY, labelWidth, labelHeight),
+                    label, gridCoordinateStyle);
+            }
+        }
+
+        private void EnsureGridCoordinateStyles()
+        {
+            if (gridCoordinateStyle != null)
+                return;
+
+            gridCoordinateStyle = new GUIStyle(GUI.skin.label)
+            {
+                alignment = TextAnchor.MiddleCenter
+            };
+            gridCoordinateStyle.normal.textColor = new Color(1f, 1f, 1f, 0.62f);
+
+            gridCoordinateShadowStyle = new GUIStyle(gridCoordinateStyle);
+            gridCoordinateShadowStyle.normal.textColor = new Color(0f, 0f, 0f, 0.38f);
         }
 
         private ApiResponse AddRoad(string body)
@@ -585,6 +685,8 @@ namespace Moretoways
                 request.Completion.TrySetResult(new ApiResponse(503,
                     "{\"success\":false,\"error\":\"Plugin stopped\"}"));
 
+            gridGameUI = null;
+            gridTilemapView = null;
             pluginInstance = null;
         }
 
@@ -622,6 +724,13 @@ namespace Moretoways
         {
             if (pluginInstance != null)
                 pluginInstance.initialSimulationSeed = seed;
+        }
+
+        [HarmonyPrefix, HarmonyPatch(typeof(GameUIScreen), nameof(GameUIScreen.SetWorldGridActive))]
+        private static void KeepWorldGridVisible(ref bool active)
+        {
+            if (pluginInstance != null && pluginInstance.alwaysShowWorldGrid)
+                active = true;
         }
     }
 }

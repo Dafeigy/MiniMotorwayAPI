@@ -77,6 +77,18 @@
       <HintPath>F:\SteamLibrary\steamapps\common\Mini Motorways\Mini Motorways_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
       <Private>False</Private>
     </Reference>
+    <Reference Include="UnityEngine.InputLegacyModule">
+      <HintPath>F:\SteamLibrary\steamapps\common\Mini Motorways\Mini Motorways_Data\Managed\UnityEngine.InputLegacyModule.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="UnityEngine.IMGUIModule">
+      <HintPath>F:\SteamLibrary\steamapps\common\Mini Motorways\Mini Motorways_Data\Managed\UnityEngine.IMGUIModule.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="UnityEngine.TextRenderingModule">
+      <HintPath>F:\SteamLibrary\steamapps\common\Mini Motorways\Mini Motorways_Data\Managed\UnityEngine.TextRenderingModule.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
   </ItemGroup>
   <ItemGroup>
     <Compile Include="Moretoways.cs" />
