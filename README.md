@@ -74,6 +74,69 @@ active outbound delivery. House `contentData.vehicleCounts` reports owned,
 waiting, currently available, and driveway-realigning vehicles. These fields
 describe existing simulation relationships and do not run pathfinding.
 
+The relevant portion of a snapshot has the following shape (unrelated fields
+are omitted):
+
+```json
+{
+  "initialSeed": 20261014,
+  "vehicleCount": 1,
+  "vehicles": [
+    {
+      "vehicleId": 21,
+      "state": "DrivingToDestination",
+      "houseBuildingId": "H:-5:-1",
+      "destinationBuildingId": "D:-12:-3",
+      "lastVisitedDestinationBuildingId": null
+    }
+  ],
+  "tiles": [
+    {
+      "contentType": "House",
+      "buildingId": "H:-5:-1",
+      "contentData": {
+        "groupIndex": 0,
+        "hasWaitingVehicle": true,
+        "vehicleCounts": {
+          "owned": 2,
+          "waiting": 1,
+          "available": 1,
+          "realigning": 0
+        }
+      }
+    },
+    {
+      "contentType": "Destination",
+      "buildingId": "D:-12:-3",
+      "contentData": {
+        "groupIndex": 0,
+        "totalDemand": 1,
+        "demand": {
+          "total": 1,
+          "unassigned": 0,
+          "assigned": 1,
+          "unassignedByGroup": {},
+          "assignedByGroup": { "0": 1 },
+          "maximumBeforeOvercrowding": 6,
+          "isOvercrowding": false,
+          "overcrowdingTime": 0.0,
+          "overcrowdingSpeed": 0.0,
+          "generationTimer": 3.1,
+          "totalServiced": 0
+        }
+      }
+    }
+  ]
+}
+```
+
+Destinations generate and hold demand. Houses own and supply vehicles. A
+demand pin is associated with a group until dispatch; only then does the
+vehicle establish a concrete house-to-destination relationship. After service,
+the same vehicle returns to its owning house. See the
+[snapshot development roadmap](docs/snapshot-roadmap.md) for the detailed
+semantics, completed phases, and intentionally deferred pathfinding data.
+
 Normal games use the fixed simulation seed `20261014`. The seed actually used
 to initialize the current game is returned as `initialSeed` by `/snapshot` and
 `/game/status`. Daily and weekly challenge seeds are left unchanged. Changing
@@ -91,7 +154,11 @@ the game is open. It uses only the standard library:
 python tests/apitest.py
 ```
 
-The default run checks all five read endpoints without changing the game.
+The default run checks all five read endpoints without changing the game. It
+also verifies demand totals, per-group counts, vehicle IDs and references,
+house vehicle counts, and the relationship between assigned demand and
+outbound vehicles.
+
 To test the visible result, resume the game and choose two adjacent empty tiles
 (the example uses `(0, 0)` and `(1, 0)`). Run these commands separately:
 
@@ -127,5 +194,6 @@ HTTP 202 when the edit is scheduled.
   executed, changed both endpoint tiles, and adjusted the concrete count.
   Restart is restricted to the game-over screen and still needs a live smoke test.
 - Additional upgrades, time control, and restart during an active game are not implemented.
-- The game phase is inferred from active UI screens and requires live validation.
+- The game phase is inferred from active UI screens and may be ambiguous during
+  transitional loading frames.
 - Vehicle positions, complete lane paths, route costs, and ETA are not in the snapshot.
