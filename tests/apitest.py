@@ -97,6 +97,9 @@ def validate_read_api(base_url):
     check(isinstance(snapshot.get("snapshotId"), int), "/snapshot: missing snapshotId")
     check(isinstance(snapshot.get("editCommandsExecuted"), int),
           "/snapshot: missing editCommandsExecuted")
+    if snapshot.get("phase") == "playing":
+        check(isinstance(snapshot.get("initialSeed"), int),
+              "/snapshot: missing initialSeed for active game")
     check(snapshot["tileCount"] == len(snapshot["tiles"]), "/snapshot: tile count mismatch")
     check(status.get("success") is True
           and status.get("phase") in {"menu", "playing", "gameOver"},
@@ -125,6 +128,7 @@ def validate_read_api(base_url):
         "snapshotId": snapshot["snapshotId"],
         "editCommandsExecuted": snapshot["editCommandsExecuted"],
         "score": snapshot.get("score"),
+        "initialSeed": snapshot.get("initialSeed"),
         "tileCount": snapshot["tileCount"],
         "destinations": len(destinations),
         "resources": snapshot.get("resources"),

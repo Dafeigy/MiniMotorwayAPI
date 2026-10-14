@@ -44,6 +44,12 @@ represent one building. `/destinations` returns each building once.
 `groupIndex` is the stable identifier to use for matching houses and
 destinations; its display color may vary by city.
 
+Normal games use the fixed simulation seed `20261014`. The seed actually used
+to initialize the current game is returned as `initialSeed` by `/snapshot` and
+`/game/status`. Daily and weekly challenge seeds are left unchanged. Changing
+the constant requires rebuilding the plugin; runtime configuration is planned
+for a later GUI/configuration update.
+
 When the game is not updating its main thread, a request returns HTTP 503 after
 five seconds. A valid snapshot with `tileCount: 0` means that no current tilemap
 was found yet; clients should wait for `phase: "playing"` and a nonzero count.

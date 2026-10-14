@@ -23,6 +23,10 @@ namespace Moretoways
     {
         private const int Port = 9000;
         private const int RequestTimeoutMs = 5000;
+        // Normal games otherwise consume a new value from Random.NextSimulationSeed()
+        // every time they start. Keep this constant until a GUI/configuration surface
+        // is added for choosing a seed at runtime.
+        private const uint FixedSimulationSeed = 20261014u;
 
         private readonly ConcurrentQueue<SnapshotRequest> requests = new ConcurrentQueue<SnapshotRequest>();
         private HttpListener httpListener;
@@ -32,6 +36,7 @@ namespace Moretoways
         private long snapshotId;
         private int editCommandsExecuted;
         private int lastScore;
+        private ulong? initialSimulationSeed;
         private static Moretoways pluginInstance;
 
         private sealed class SnapshotRequest
@@ -97,6 +102,7 @@ namespace Moretoways
             public bool tilemapView;
             public bool camera;
             public string timeScaleMode;
+            public ulong? initialSeed;
             public int? score;
             public object clock;
             public object resources;
@@ -381,7 +387,8 @@ namespace Moretoways
                 gameUI = gameUI != null,
                 tilemapView = tilemapView != null,
                 camera = Camera.main != null,
-                timeScaleMode = gameUI == null ? null : gameUI.GetTimeScaleMode().ToString()
+                timeScaleMode = gameUI == null ? null : gameUI.GetTimeScaleMode().ToString(),
+                initialSeed = initialSimulationSeed
             };
 
             if (gameUI == null)
@@ -556,6 +563,7 @@ namespace Moretoways
                         phase = snapshot.phase, gameUI = snapshot.gameUI,
                         tilemapView = snapshot.tilemapView, camera = snapshot.camera,
                         timeScaleMode = snapshot.timeScaleMode,
+                        initialSeed = snapshot.initialSeed,
                         tileCount = snapshot.tileCount, score = snapshot.score,
                         clock = snapshot.clock, resources = snapshot.resources,
                         timestamp = snapshot.timestamp
@@ -599,6 +607,21 @@ namespace Moretoways
         {
             if (pluginInstance != null)
                 pluginInstance.editCommandsExecuted++;
+        }
+
+        [HarmonyPrefix, HarmonyPatch(typeof(InitCityCommand), "CreateNormalCity")]
+        private static void UseFixedSimulationSeed(ref uint seed)
+        {
+            seed = FixedSimulationSeed;
+            if (pluginInstance != null)
+                pluginInstance.Logger.LogInfo("Using fixed simulation seed " + seed);
+        }
+
+        [HarmonyPrefix, HarmonyPatch(typeof(InitCityCommand), "Initialize")]
+        private static void CaptureInitialSimulationSeed(ulong seed)
+        {
+            if (pluginInstance != null)
+                pluginInstance.initialSimulationSeed = seed;
         }
     }
 }
