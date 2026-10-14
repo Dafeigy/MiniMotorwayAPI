@@ -43,7 +43,7 @@ thread never reads live Unity or game objects.
 | `GET /snapshot` | Full game state snapshot. `/` is an alias. |
 | `GET /tiles` | Tiles from a single snapshot. |
 | `GET /tiles/count` | Tile count. |
-| `GET /destinations` | One entry per destination building, including `groupIndex`, demand, footprint, and carpark coordinates. |
+| `GET /destinations` | One entry per destination building, including `groupIndex`, demand state, footprint, and carpark coordinates. |
 | `GET /game/status` | Phase, score, clock, available resources, and readiness flags. |
 | `POST /actions/road` | Add one road connection from `(x, y)` in `direction`. |
 | `POST /actions/clear` | Clear roads on tile `(x, y)`, respecting the game's permanence rules. |
@@ -52,12 +52,27 @@ thread never reads live Unity or game objects.
 `/snapshot` includes a monotonically increasing `snapshotId`, UTC timestamp,
 phase (`menu`, `playing`, or `gameOver`), time scale mode, score, clock, available upgrades, and
 `editCommandsExecuted` (a diagnostic count of simulation edit commands), and
-tile list. Each tile contains its coordinates, content type and type-specific
+tile and vehicle lists. Each tile contains its coordinates, content type and type-specific
 data, directional road states, and traffic light / roundabout information.
 Destination buildings occupy multiple tiles; tiles sharing a `buildingId`
 represent one building. `/destinations` returns each building once.
 `groupIndex` is the stable identifier to use for matching houses and
 destinations; its display color may vary by city.
+
+Each destination also includes a nested `demand` object. `unassigned` counts
+pins that have not selected a vehicle yet, while `assigned` counts pins with a
+vehicle dispatched but not yet arrived. The corresponding `*ByGroup` objects
+show the vehicle group required by those pins. The object also reports the
+overcrowding threshold and current timer state, the demand-generation timer,
+and the number of pins serviced by the destination. The legacy `totalDemand`
+field remains available and equals `demand.total`.
+
+The top-level `vehicles` list reports each vehicle's stable `vehicleId`, current
+behavior state, owning `houseBuildingId`, assigned `destinationBuildingId`, and
+last visited destination. A non-null `destinationBuildingId` identifies an
+active outbound delivery. House `contentData.vehicleCounts` reports owned,
+waiting, currently available, and driveway-realigning vehicles. These fields
+describe existing simulation relationships and do not run pathfinding.
 
 Normal games use the fixed simulation seed `20261014`. The seed actually used
 to initialize the current game is returned as `initialSeed` by `/snapshot` and
@@ -113,4 +128,4 @@ HTTP 202 when the edit is scheduled.
   Restart is restricted to the game-over screen and still needs a live smoke test.
 - Additional upgrades, time control, and restart during an active game are not implemented.
 - The game phase is inferred from active UI screens and requires live validation.
-- Full vehicle locations and per-destination timer state are not in the snapshot yet.
+- Vehicle positions, complete lane paths, route costs, and ETA are not in the snapshot.

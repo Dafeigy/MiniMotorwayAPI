@@ -23,6 +23,15 @@ DIRECTIONS = {
     "NorthWest": (-1, 1, "SouthEast"),
 }
 
+VEHICLE_STATES = {
+    "WaitingForDestination",
+    "DrivingToDestination",
+    "ParkingAtDestination",
+    "ParkedAtDestination",
+    "DrivingHome",
+    "RealigningDriveway",
+}
+
 
 class ValidationError(Exception):
     pass
@@ -101,12 +110,85 @@ def validate_read_api(base_url):
         check(isinstance(snapshot.get("initialSeed"), int),
               "/snapshot: missing initialSeed for active game")
     check(snapshot["tileCount"] == len(snapshot["tiles"]), "/snapshot: tile count mismatch")
+    vehicles = snapshot.get("vehicles")
+    check(isinstance(vehicles, list), "/snapshot: missing vehicles")
+    check(snapshot.get("vehicleCount") == len(vehicles),
+          "/snapshot: vehicle count mismatch")
     check(status.get("success") is True
           and status.get("phase") in {"menu", "playing", "gameOver"},
           "/game/status: invalid phase")
     check(tiles_response.get("count") == len(tiles_response.get("tiles", [])),
           "/tiles: count mismatch")
     check(isinstance(count_response.get("count"), int), "/tiles/count: invalid count")
+
+    houses = [tile for tile in snapshot["tiles"]
+              if tile.get("contentType") == "House"]
+    house_ids = {house.get("buildingId") for house in houses}
+    check(None not in house_ids and len(house_ids) == len(houses),
+          "/snapshot: missing or duplicate house buildingId")
+
+    snapshot_destinations = {}
+    for tile in snapshot["tiles"]:
+        if tile.get("contentType") == "Destination":
+            snapshot_destinations.setdefault(tile.get("buildingId"), tile)
+    destination_ids = set(snapshot_destinations)
+    check(None not in destination_ids, "/snapshot: missing destination buildingId")
+
+    vehicle_ids = [vehicle.get("vehicleId") for vehicle in vehicles]
+    check(all(isinstance(vehicle_id, int) for vehicle_id in vehicle_ids)
+          and len(vehicle_ids) == len(set(vehicle_ids)),
+          "/snapshot: missing or duplicate vehicleId")
+    for vehicle in vehicles:
+        check(vehicle.get("state") in VEHICLE_STATES,
+              "/snapshot: invalid vehicle state")
+        check(vehicle.get("houseBuildingId") in house_ids,
+              "/snapshot: vehicle references an unknown house")
+        destination_id = vehicle.get("destinationBuildingId")
+        check(destination_id is None or destination_id in destination_ids,
+              "/snapshot: vehicle references an unknown destination")
+        last_destination_id = vehicle.get("lastVisitedDestinationBuildingId")
+        check(last_destination_id is None or isinstance(last_destination_id, str),
+              "/snapshot: invalid last visited destination")
+
+    vehicles_by_house = {}
+    for vehicle in vehicles:
+        vehicles_by_house.setdefault(vehicle["houseBuildingId"], []).append(vehicle)
+    for house in houses:
+        data = house.get("contentData") or {}
+        counts = data.get("vehicleCounts")
+        check(isinstance(counts, dict), "/snapshot: missing house vehicleCounts")
+        for field in ("owned", "waiting", "available", "realigning"):
+            check(isinstance(counts.get(field), int) and counts[field] >= 0,
+                  f"/snapshot: invalid house vehicleCounts.{field}")
+        check(counts["waiting"] <= counts["owned"]
+              and counts["available"] <= counts["waiting"]
+              and counts["realigning"] <= counts["owned"],
+              "/snapshot: inconsistent house vehicle counts")
+        check(data.get("hasWaitingVehicle") is (counts["waiting"] > 0),
+              "/snapshot: house waiting state mismatch")
+        house_vehicles = vehicles_by_house.get(house["buildingId"], [])
+        check(counts["owned"] == len(house_vehicles),
+              "/snapshot: house owned vehicle count mismatch")
+        check(counts["waiting"] == sum(
+            vehicle["state"] == "WaitingForDestination"
+            for vehicle in house_vehicles
+        ), "/snapshot: house waiting vehicle count mismatch")
+        check(counts["realigning"] == sum(
+            vehicle["state"] == "RealigningDriveway"
+            for vehicle in house_vehicles
+        ), "/snapshot: house realigning vehicle count mismatch")
+
+    vehicles_by_destination = {}
+    for vehicle in vehicles:
+        destination_id = vehicle.get("destinationBuildingId")
+        if destination_id is not None:
+            vehicles_by_destination[destination_id] = (
+                vehicles_by_destination.get(destination_id, 0) + 1
+            )
+    for destination_id, destination in snapshot_destinations.items():
+        demand = (destination.get("contentData") or {}).get("demand") or {}
+        check(demand.get("assigned") == vehicles_by_destination.get(destination_id, 0),
+              "/snapshot: assigned demand and vehicle relationship mismatch")
 
     destinations = destinations_response.get("destinations", [])
     check(destinations_response.get("count") == len(destinations),
@@ -120,6 +202,32 @@ def validate_read_api(base_url):
         data = destination.get("contentData") or {}
         check("groupIndex" in data and "totalDemand" in data and "carpark" in data,
               "/destinations: missing building data")
+        demand = data.get("demand")
+        check(isinstance(demand, dict), "/destinations: missing demand detail")
+        for field in ("total", "unassigned", "assigned",
+                      "maximumBeforeOvercrowding", "totalServiced"):
+            check(isinstance(demand.get(field), int) and demand[field] >= 0,
+                  f"/destinations: invalid demand.{field}")
+        check(demand["total"] == data["totalDemand"],
+              "/destinations: detailed and legacy demand totals differ")
+        check(demand["total"] == demand["unassigned"] + demand["assigned"],
+              "/destinations: demand total mismatch")
+        check(demand.get("isOvercrowding") is data.get("isOvercrowding"),
+              "/destinations: overcrowding states differ")
+        for field in ("overcrowdingTime", "overcrowdingSpeed", "generationTimer"):
+            check(isinstance(demand.get(field), (int, float))
+                  and not isinstance(demand[field], bool),
+                  f"/destinations: invalid demand.{field}")
+        for field, expected in (("unassignedByGroup", demand["unassigned"]),
+                                ("assignedByGroup", demand["assigned"])):
+            groups = demand.get(field)
+            check(isinstance(groups, dict), f"/destinations: invalid demand.{field}")
+            check(all(isinstance(key, str) and key.lstrip("-").isdigit()
+                      and isinstance(value, int) and value >= 0
+                      for key, value in groups.items()),
+                  f"/destinations: invalid demand.{field} entry")
+            check(sum(groups.values()) == expected,
+                  f"/destinations: demand.{field} total mismatch")
 
     print("READ API PASS")
     print(json.dumps({
@@ -130,6 +238,7 @@ def validate_read_api(base_url):
         "score": snapshot.get("score"),
         "initialSeed": snapshot.get("initialSeed"),
         "tileCount": snapshot["tileCount"],
+        "vehicleCount": snapshot.get("vehicleCount"),
         "destinations": len(destinations),
         "resources": snapshot.get("resources"),
     }, ensure_ascii=False, indent=2))

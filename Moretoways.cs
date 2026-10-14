@@ -111,8 +111,19 @@ namespace Moretoways
             public int? score;
             public object clock;
             public object resources;
+            public int vehicleCount;
+            public List<VehicleSnapshot> vehicles = new List<VehicleSnapshot>();
             public int tileCount;
             public List<TileSnapshot> tiles = new List<TileSnapshot>();
+        }
+
+        private sealed class VehicleSnapshot
+        {
+            public int vehicleId;
+            public string state;
+            public string houseBuildingId;
+            public string destinationBuildingId;
+            public string lastVisitedDestinationBuildingId;
         }
 
         private void Start()
@@ -532,6 +543,20 @@ namespace Moretoways
                 snapshot.resources = available;
             }
 
+            var simulation = Traverse.Create(gameUI).Field("_simulation").GetValue<Server.ISimulation>();
+            if (simulation != null)
+            {
+                var vehicleModels = simulation.GetModels<VehicleModel>();
+                var vehicleEnumerator = vehicleModels.GetEnumerator();
+                while (vehicleEnumerator.MoveNext())
+                {
+                    VehicleModel vehicle = vehicleEnumerator.Current;
+                    if (vehicle != null)
+                        snapshot.vehicles.Add(CaptureVehicle(vehicle));
+                }
+            }
+            snapshot.vehicleCount = snapshot.vehicles.Count;
+
             if (tilemap != null)
             {
                 var tiles = Traverse.Create(tilemap).Field("_tiles")
@@ -566,7 +591,22 @@ namespace Moretoways
             if (tile.ContentType == TileContentType.House && tile.ContentModel is HouseModel house)
             {
                 buildingId = "H:" + coordinates.x + ":" + coordinates.y;
-                contentData = new { groupIndex = house.GroupIndex, hasWaitingVehicle = house.HasWaitingVehicle };
+                var houseData = Traverse.Create(house);
+                var ownedVehicles = houseData.Field("ownedVehicles").GetValue<List<VehicleModel>>();
+                var waitingVehicles = houseData.Field("waitingVehicles").GetValue<List<VehicleModel>>();
+                var realigningVehicles = houseData.Field("realigningVehicles").GetValue<List<VehicleModel>>();
+                contentData = new
+                {
+                    groupIndex = house.GroupIndex,
+                    hasWaitingVehicle = house.HasWaitingVehicle,
+                    vehicleCounts = new
+                    {
+                        owned = CountVehicles(ownedVehicles),
+                        waiting = CountVehicles(waitingVehicles),
+                        available = CountAvailableVehicles(waitingVehicles),
+                        realigning = CountVehicles(realigningVehicles)
+                    }
+                };
             }
             else if (tile.ContentType == TileContentType.Destination &&
                      tile.ContentModel is DestinationModel destination)
@@ -592,12 +632,33 @@ namespace Moretoways
                     Traverse.Create(carpark).Field("entranceAtTopLeft").GetValue<bool>();
                 bool hasBottomRightEntrance = carpark != null &&
                     Traverse.Create(carpark).Field("entranceAtBottomRight").GetValue<bool>();
+                var destinationFrame = destination.CurrentFrame;
+                int unassignedDemandCount = destination.unassignedDemand.Count;
+                int assignedDemandCount = destination.waitingDemand.Count;
                 contentData = new
                 {
                     groupIndex = destination.GroupIndex,
                     totalDemand = destination.TotalDemand,
                     isOvercrowding = destination.IsOvercrowding,
                     isUpgraded = destination.IsUpgraded,
+                    demand = new
+                    {
+                        total = destination.TotalDemand,
+                        unassigned = unassignedDemandCount,
+                        assigned = assignedDemandCount,
+                        unassignedByGroup = CountDemandByGroup(destination.unassignedDemand),
+                        assignedByGroup = CountDemandByGroup(destination.waitingDemand),
+                        maximumBeforeOvercrowding = destination.MaximumDemandBeforeTimerStarts,
+                        isOvercrowding = destination.IsOvercrowding,
+                        overcrowdingTime = destinationFrame == null
+                            ? (double?)null
+                            : (double)destinationFrame.OvercrowdingTime,
+                        overcrowdingSpeed = destinationFrame == null
+                            ? (double?)null
+                            : (double)destinationFrame.OvercrowdingSpeed,
+                        generationTimer = (double)destination.demandTimer,
+                        totalServiced = destination.totalServicedPins
+                    },
                     footprint = footprint,
                     carpark = carpark == null ? null : new
                     {
@@ -624,6 +685,96 @@ namespace Moretoways
                 drivewayDirection = tile.DrivewayDirection.ToString(),
                 unbuiltMotorwayId = tile.UnbuiltMotorwayId
             };
+        }
+
+        private static VehicleSnapshot CaptureVehicle(VehicleModel vehicle)
+        {
+            var vehicleData = Traverse.Create(vehicle);
+            var behaviorState = vehicleData.Field("behaviorState").GetValue<object>();
+            var house = vehicleData.Field("house").GetValue<HouseModel>();
+            var destination = vehicleData.Field("destination").GetValue<DestinationModel>();
+            var lastVisitedDestination = vehicleData.Field("lastVisitedDestination")
+                .GetValue<DestinationModel>();
+            return new VehicleSnapshot
+            {
+                vehicleId = vehicleData.Field("id").GetValue<int>(),
+                state = behaviorState == null ? null : behaviorState.ToString(),
+                houseBuildingId = GetHouseBuildingId(house),
+                destinationBuildingId = GetDestinationBuildingId(destination),
+                lastVisitedDestinationBuildingId = GetDestinationBuildingId(lastVisitedDestination)
+            };
+        }
+
+        private static string GetHouseBuildingId(HouseModel house)
+        {
+            if (house == null || house.tileModel == null)
+                return null;
+
+            Vector2Int coordinates = house.tileModel.Coordinates;
+            return "H:" + coordinates.x + ":" + coordinates.y;
+        }
+
+        private static string GetDestinationBuildingId(DestinationModel destination)
+        {
+            if (destination == null || destination.TileModels == null)
+                return null;
+
+            bool foundCoordinates = false;
+            int minX = 0;
+            int minY = 0;
+            foreach (TileModel tileModel in destination.TileModels)
+            {
+                if (tileModel == null)
+                    continue;
+
+                Vector2Int coordinates = tileModel.Coordinates;
+                if (!foundCoordinates)
+                {
+                    minX = coordinates.x;
+                    minY = coordinates.y;
+                    foundCoordinates = true;
+                }
+                else
+                {
+                    minX = Math.Min(minX, coordinates.x);
+                    minY = Math.Min(minY, coordinates.y);
+                }
+            }
+            return foundCoordinates ? "D:" + minX + ":" + minY : null;
+        }
+
+        private static int CountVehicles(List<VehicleModel> vehicles)
+        {
+            return vehicles == null ? 0 : vehicles.Count;
+        }
+
+        private static int CountAvailableVehicles(List<VehicleModel> vehicles)
+        {
+            if (vehicles == null)
+                return 0;
+
+            int count = 0;
+            foreach (VehicleModel vehicle in vehicles)
+            {
+                if (vehicle != null && vehicle.IsAvailableAtHouse)
+                    count++;
+            }
+            return count;
+        }
+
+        private static Dictionary<int, int> CountDemandByGroup(IEnumerable<int> demandGroups)
+        {
+            var counts = new Dictionary<int, int>();
+            if (demandGroups == null)
+                return counts;
+
+            foreach (int groupIndex in demandGroups)
+            {
+                int count;
+                counts.TryGetValue(groupIndex, out count);
+                counts[groupIndex] = count + 1;
+            }
+            return counts;
         }
 
         private static string SerializeResponse(GameSnapshot snapshot, string path)
