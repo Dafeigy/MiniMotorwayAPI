@@ -49,7 +49,8 @@ thread never reads live Unity or game objects.
 | `POST /actions/clear` | Clear roads on tile `(x, y)`, respecting the game's permanence rules. |
 | `POST /game/restart` | Restart from an active game-over screen. |
 
-`/snapshot` includes a monotonically increasing `snapshotId`, UTC timestamp,
+`/snapshot` includes a `snapshotId` that starts at 1 for each new game and
+increases monotonically until the next game starts, plus a UTC timestamp,
 phase (`menu`, `playing`, or `gameOver`), time scale mode, score, clock, available upgrades, and
 `editCommandsExecuted` (a diagnostic count of simulation edit commands), and
 tile and vehicle lists. Each tile contains its coordinates, content type and type-specific

@@ -874,7 +874,13 @@ namespace Moretoways
         private static void CaptureInitialSimulationSeed(ulong seed)
         {
             if (pluginInstance != null)
+            {
+                // snapshotId identifies captures within one game. Reset it at
+                // the city initialization boundary so API restarts, UI
+                // restarts, and newly started games all begin at snapshot 1.
+                pluginInstance.snapshotId = 0;
                 pluginInstance.initialSimulationSeed = seed;
+            }
         }
 
         [HarmonyPrefix, HarmonyPatch(typeof(GameUIScreen), nameof(GameUIScreen.SetWorldGridActive))]
