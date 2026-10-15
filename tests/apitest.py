@@ -6,9 +6,11 @@ the game between edits. Uses only Python's standard library.
 
 import argparse
 import json
+import socket
 import sys
 import time
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 
@@ -42,13 +44,14 @@ def check(condition, message):
         raise ValidationError(message)
 
 
-def request(base_url, path, *, body=None, expected_status=200, timeout=8):
+def request(base_url, path, *, body=None, method=None, expected_status=200, timeout=8):
     data = None if body is None else json.dumps(body).encode("utf-8")
+    request_method = method or ("POST" if data is not None else "GET")
     req = Request(
         base_url + path,
         data=data,
         headers={"Content-Type": "application/json"} if data is not None else {},
-        method="POST" if data is not None else "GET",
+        method=request_method,
     )
     try:
         with urlopen(req, timeout=timeout) as response:
@@ -65,6 +68,50 @@ def request(base_url, path, *, body=None, expected_status=200, timeout=8):
     except (ValueError, UnicodeError) as error:
         raise ValidationError(f"{path}: invalid JSON response: {error}") from error
     check(status == expected_status, f"{path}: HTTP {status}, expected {expected_status}: {payload}")
+    check(isinstance(payload, dict), f"{path}: expected a JSON object")
+    return payload
+
+
+def bodyless_post(base_url, path, *, expected_status=200, timeout=8):
+    """Send POST without Content-Length to cover Mono's former HTTP 411 path."""
+    parsed = urlsplit(base_url)
+    check(parsed.scheme == "http" and parsed.hostname,
+          "Bodyless POST smoke tests require an http:// base URL")
+    port = parsed.port or 80
+    host_header = parsed.hostname if port == 80 else f"{parsed.hostname}:{port}"
+    request_bytes = (
+        f"POST {path} HTTP/1.1\r\n"
+        f"Host: {host_header}\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+    ).encode("ascii")
+    try:
+        with socket.create_connection((parsed.hostname, port), timeout=timeout) as connection:
+            connection.settimeout(timeout)
+            connection.sendall(request_bytes)
+            chunks = []
+            while True:
+                chunk = connection.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+    except (OSError, TimeoutError) as error:
+        raise ValidationError(f"{path}: raw POST failed: {error}") from error
+
+    raw_response = b"".join(chunks)
+    head, separator, body = raw_response.partition(b"\r\n\r\n")
+    check(separator, f"{path}: invalid raw HTTP response")
+    status_line = head.split(b"\r\n", 1)[0].decode("ascii", errors="replace")
+    parts = status_line.split(" ", 2)
+    check(len(parts) >= 2 and parts[1].isdigit(),
+          f"{path}: invalid HTTP status line: {status_line}")
+    status = int(parts[1])
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (ValueError, UnicodeError) as error:
+        raise ValidationError(f"{path}: invalid JSON response: {error}") from error
+    check(status == expected_status,
+          f"{path}: HTTP {status}, expected {expected_status}: {payload}")
     check(isinstance(payload, dict), f"{path}: expected a JSON object")
     return payload
 
@@ -96,6 +143,7 @@ def poll_snapshot(base_url, timeout, predicate, description):
 
 
 def validate_read_api(base_url):
+    preflight = request(base_url, "/game/pause", method="OPTIONS")
     snapshot = request(base_url, "/snapshot")
     status = request(base_url, "/game/status")
     tiles_response = request(base_url, "/tiles")
@@ -103,6 +151,7 @@ def validate_read_api(base_url):
     destinations_response = request(base_url, "/destinations")
 
     check(snapshot.get("success") is True, "/snapshot: success is not true")
+    check(preflight == {}, "OPTIONS /game/pause: expected an empty JSON object")
     check(isinstance(snapshot.get("snapshotId"), int), "/snapshot: missing snapshotId")
     check(isinstance(snapshot.get("editCommandsExecuted"), int),
           "/snapshot: missing editCommandsExecuted")
@@ -269,6 +318,47 @@ def require_running(snapshot):
           "Road test requires the game to be running")
 
 
+def set_paused(base_url, paused):
+    initial = request(base_url, "/snapshot")
+    check(initial["phase"] == "playing", "Time control requires an active game")
+    path = "/game/pause" if paused else "/game/resume"
+    expected_mode = "Paused" if paused else "Play"
+    result = bodyless_post(base_url, path)
+    check(result.get("success") is True, f"{path}: operation failed: {result}")
+    check(result.get("currentMode") == expected_mode,
+          f"{path}: expected {expected_mode}, got {result.get('currentMode')}")
+    observed = poll_snapshot(
+        base_url, 2,
+        lambda snapshot: snapshot.get("timeScaleMode") == expected_mode,
+        f"time scale mode to become {expected_mode}",
+    )
+    print(json.dumps({"response": result, "snapshotId": observed["snapshotId"]},
+                     ensure_ascii=False, indent=2))
+    print(("PAUSE" if paused else "RESUME") + " PASS")
+
+
+def restart_game(base_url, poll_timeout):
+    initial = request(base_url, "/snapshot")
+    check(initial["phase"] in {"playing", "gameOver"},
+          "Restart requires an active or game-over game")
+    result = bodyless_post(base_url, "/game/restart", expected_status=202)
+    check(result.get("success") is True, f"Restart was not accepted: {result}")
+    restarted = poll_snapshot(
+        base_url, poll_timeout,
+        lambda snapshot: snapshot.get("phase") == "playing"
+        and snapshot.get("snapshotId", 0) <= 5
+        and snapshot.get("tileCount", 0) > 0,
+        "a fresh playable game",
+    )
+    print(json.dumps({
+        "response": result,
+        "snapshotId": restarted["snapshotId"],
+        "initialSeed": restarted.get("initialSeed"),
+        "tileCount": restarted["tileCount"],
+    }, ensure_ascii=False, indent=2))
+    print("RESTART PASS")
+
+
 def add_road(base_url, x, y, direction, poll_timeout):
     initial = request(base_url, "/snapshot")
     require_running(initial)
@@ -338,6 +428,12 @@ def main():
                          help="Clear one isolated road from the selected tiles")
     actions.add_argument("--inspect-road", nargs=3, metavar=("X", "Y", "DIRECTION"),
                          help="Show the current state of two adjacent tiles")
+    actions.add_argument("--pause", action="store_true",
+                         help="Pause the active game and leave it paused")
+    actions.add_argument("--resume", action="store_true",
+                         help="Resume the active game at normal speed")
+    actions.add_argument("--restart", action="store_true",
+                         help="Restart the current game (destructive)")
     parser.add_argument("--poll-timeout", type=float, default=10,
                         help="Seconds to wait for each road edit (default: 10)")
     args = parser.parse_args()
@@ -361,6 +457,12 @@ def main():
             else:
                 print_road_state("CURRENT ROAD", request(base_url, "/snapshot"),
                                  x, y, direction)
+        elif args.pause:
+            set_paused(base_url, True)
+        elif args.resume:
+            set_paused(base_url, False)
+        elif args.restart:
+            restart_game(base_url, args.poll_timeout)
     except ValidationError as error:
         print(f"FAIL: {error}", file=sys.stderr)
         return 1

@@ -181,12 +181,21 @@ namespace Moretoways
         private void ProcessRequest(HttpListenerContext context)
         {
             var response = context.Response;
+            string method = context.Request.HttpMethod;
+            string path = context.Request.Url.AbsolutePath;
             try
             {
-                string path = context.Request.Url.AbsolutePath;
+                AddCorsHeaders(response);
+                if (method == "OPTIONS")
+                {
+                    SendJson(response, 200, "{}");
+                    return;
+                }
+
                 bool isAction = path == "/actions/road" || path == "/actions/clear" ||
-                    path == "/game/restart";
-                if (context.Request.HttpMethod != (isAction ? "POST" : "GET"))
+                    path == "/game/restart" || path == "/game/pause" ||
+                    path == "/game/resume";
+                if (method != (isAction ? "POST" : "GET"))
                 {
                     SendJson(response, 405, "{\"error\":\"Method Not Allowed\"}");
                     return;
@@ -228,18 +237,61 @@ namespace Moretoways
                 ApiResponse result = request.Completion.Task.Result;
                 SendJson(response, result.StatusCode, result.Json);
             }
+            catch (ObjectDisposedException)
+            {
+                Logger.LogDebug("HTTP client disconnected before response: " + method + " " + path);
+            }
+            catch (HttpListenerException exception)
+            {
+                Logger.LogDebug("HTTP connection ended before response: " + method + " " + path +
+                    " (" + exception.ErrorCode + ")");
+            }
+            catch (IOException exception)
+            {
+                Logger.LogDebug("HTTP stream ended before response: " + method + " " + path +
+                    " (" + exception.Message + ")");
+            }
             catch (Exception exception)
             {
-                Logger.LogError("HTTP request failed: " + exception);
-                try
-                {
-                    SendJson(response, 500, "{\"error\":\"Internal Server Error\"}");
-                }
-                catch (Exception) { }
+                Logger.LogError("HTTP request failed for " + method + " " + path + ": " + exception);
+                TrySendJson(response, 500, "{\"error\":\"Internal Server Error\"}");
             }
             finally
             {
-                response.Close();
+                try
+                {
+                    response.Close();
+                }
+                catch (ObjectDisposedException) { }
+            }
+        }
+
+        private static void AddCorsHeaders(HttpListenerResponse response)
+        {
+            response.Headers["Access-Control-Allow-Origin"] = "*";
+            response.Headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS";
+            response.Headers["Access-Control-Allow-Headers"] = "Content-Type";
+            response.Headers["Access-Control-Max-Age"] = "600";
+        }
+
+        private static bool TrySendJson(HttpListenerResponse response, int statusCode, string json)
+        {
+            try
+            {
+                SendJson(response, statusCode, json);
+                return true;
+            }
+            catch (ObjectDisposedException)
+            {
+                return false;
+            }
+            catch (HttpListenerException)
+            {
+                return false;
+            }
+            catch (IOException)
+            {
+                return false;
             }
         }
 
@@ -248,8 +300,18 @@ namespace Moretoways
             byte[] bytes = Encoding.UTF8.GetBytes(json);
             response.StatusCode = statusCode;
             response.ContentType = "application/json; charset=utf-8";
+            response.ContentEncoding = Encoding.UTF8;
             response.ContentLength64 = bytes.Length;
-            response.OutputStream.Write(bytes, 0, bytes.Length);
+            response.KeepAlive = false;
+            response.SendChunked = false;
+            response.Headers["Cache-Control"] = "no-store";
+
+            // Mono's HttpListener does not reliably flush a response body when
+            // game control changes screens or pauses the simulation between an
+            // OutputStream.Write call and the outer finally block. This overload
+            // writes the complete body synchronously and closes the response
+            // before returning to the listener loop.
+            response.Close(bytes, true);
         }
 
         private void Update()
@@ -274,6 +336,10 @@ namespace Moretoways
                     request.Completion.TrySetResult(ClearRoads(request.Body));
                 else if (request.Path == "/game/restart")
                     request.Completion.TrySetResult(RestartGame());
+                else if (request.Path == "/game/pause")
+                    request.Completion.TrySetResult(SetGamePaused(true));
+                else if (request.Path == "/game/resume")
+                    request.Completion.TrySetResult(SetGamePaused(false));
                 else
                 {
                     GameSnapshot snapshot = CaptureSnapshot();
@@ -474,13 +540,60 @@ namespace Moretoways
         private ApiResponse RestartGame()
         {
             var gameOver = UnityEngine.Object.FindObjectOfType<GameOverScreen>();
-            if (gameOver == null)
-                return new ApiResponse(409,
-                    "{\"success\":false,\"error\":\"Restart is only available on the game-over screen\"}");
+            if (gameOver != null)
+            {
+                gameOver.OnRestart();
+                tilemap = null;
+                return new ApiResponse(202,
+                    "{\"success\":true,\"resultCode\":\"RestartRequested\"}");
+            }
 
-            gameOver.OnRestart();
+            var gameUI = UnityEngine.Object.FindObjectOfType<GameUIScreen>();
+            if (gameUI == null)
+                return new ApiResponse(409,
+                    "{\"success\":false,\"error\":\"No active game to restart\"}");
+
+            var screenStack = Traverse.Create(gameUI).Field("_screenStack").GetValue<ScreenStack>();
+            var gameScope = Traverse.Create(gameUI).Field("_gameScope").GetValue<Factory.IScope>();
+            if (screenStack == null || gameScope == null)
+                return new ApiResponse(503,
+                    "{\"success\":false,\"error\":\"Game restart services are unavailable\"}");
+
+            // Reuse the game's normal pause-menu restart path. It records the
+            // restart, releases the old game scope, preserves the current game
+            // mode, and transitions the in-game container into a fresh map.
+            PauseScreen pauseScreen = screenStack.PushScreen<PauseScreen>(
+                ScreenStack.MotorwaysScreen.Pause, false, gameScope, true);
+            if (pauseScreen == null)
+                return new ApiResponse(503,
+                    "{\"success\":false,\"error\":\"Could not open the game restart screen\"}");
+
+            Traverse.Create(pauseScreen).Method("RestartGame").GetValue();
             tilemap = null;
             return new ApiResponse(202, "{\"success\":true,\"resultCode\":\"RestartRequested\"}");
+        }
+
+        private static ApiResponse SetGamePaused(bool paused)
+        {
+            var gameUI = UnityEngine.Object.FindObjectOfType<GameUIScreen>();
+            if (gameUI == null)
+                return new ApiResponse(409,
+                    "{\"success\":false,\"error\":\"No active game\"}");
+
+            string previousMode = gameUI.GetTimeScaleMode().ToString();
+            if (paused)
+                gameUI.OnPausePressed();
+            else
+                gameUI.OnPlayPressed();
+
+            string currentMode = gameUI.GetTimeScaleMode().ToString();
+            return new ApiResponse(200, JsonConvert.SerializeObject(new
+            {
+                success = true,
+                changed = previousMode != currentMode,
+                previousMode = previousMode,
+                currentMode = currentMode
+            }));
         }
 
         private GameSnapshot CaptureSnapshot()
@@ -881,6 +994,36 @@ namespace Moretoways
                 pluginInstance.snapshotId = 0;
                 pluginInstance.initialSimulationSeed = seed;
             }
+        }
+
+        [HarmonyPrefix, HarmonyPatch(typeof(HttpListenerRequest), "FinishInitialization")]
+        private static void AcceptBodylessControlPost(HttpListenerRequest __instance)
+        {
+            // Mono returns HTTP 411 for every POST without Content-Length or
+            // Transfer-Encoding, even when the endpoint explicitly has no
+            // request body. Limit the compatibility override to the three
+            // bodyless local control endpoints; JSON edit actions retain the
+            // runtime's normal request-framing validation.
+            if (__instance == null ||
+                !string.Equals(__instance.HttpMethod, "POST", StringComparison.OrdinalIgnoreCase) ||
+                __instance.Headers["Content-Length"] != null ||
+                __instance.Headers["Transfer-Encoding"] != null)
+            {
+                return;
+            }
+
+            string rawUrl = __instance.RawUrl;
+            if (string.IsNullOrEmpty(rawUrl))
+                return;
+
+            int queryIndex = rawUrl.IndexOf('?');
+            string path = queryIndex < 0 ? rawUrl : rawUrl.Substring(0, queryIndex);
+            if (path != "/game/pause" && path != "/game/resume" && path != "/game/restart")
+                return;
+
+            Traverse request = Traverse.Create(__instance);
+            request.Field("cl_set").SetValue(true);
+            request.Field("content_length").SetValue(0L);
         }
 
         [HarmonyPrefix, HarmonyPatch(typeof(GameUIScreen), nameof(GameUIScreen.SetWorldGridActive))]

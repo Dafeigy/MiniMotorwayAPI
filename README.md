@@ -1,8 +1,8 @@
 # Moretoways
 
 BepInEx plugin for observing and controlling a running Mini Motorways game
-through a local HTTP API. Road edits, road clearing, and restart are implemented; stepping
-and other upgrades are still under development.
+through a local HTTP API. Road edits, road clearing, active-game restart, and
+pause/resume are implemented; stepping and other upgrades are still under development.
 
 ## Build
 
@@ -37,6 +37,8 @@ time Mini Motorways starts.
 The listener accepts requests on `localhost:9000`.
 Each request is passed to Unity's main thread; the server
 thread never reads live Unity or game objects.
+Browser clients may use cross-origin `GET` and `POST` requests; the listener
+answers `OPTIONS` preflight requests and exposes the corresponding CORS headers.
 
 | Endpoint | Response |
 | --- | --- |
@@ -47,7 +49,9 @@ thread never reads live Unity or game objects.
 | `GET /game/status` | Phase, score, clock, available resources, and readiness flags. |
 | `POST /actions/road` | Add one road connection from `(x, y)` in `direction`. |
 | `POST /actions/clear` | Clear roads on tile `(x, y)`, respecting the game's permanence rules. |
-| `POST /game/restart` | Restart from an active game-over screen. |
+| `POST /game/restart` | Restart the current map from an active or game-over game. |
+| `POST /game/pause` | Pause simulation while leaving the game board available for observation. |
+| `POST /game/resume` | Resume simulation at normal speed. |
 
 `/snapshot` includes a `snapshotId` that starts at 1 for each new game and
 increases monotonically until the next game starts, plus a UTC timestamp,
@@ -184,17 +188,92 @@ the simulation has already applied it. Read a later `/snapshot` to verify
 game's `resultCode`. Successful no-op edits return HTTP 200 with
 `scheduled: false`.
 
-`POST /game/restart` takes no body and returns HTTP 202 after the game-over
-screen accepts the restart request. Poll `/game/status` until `phase` is
-`playing`. `POST /actions/clear` takes `{"x": 5, "y": 7}` and also returns
-HTTP 202 when the edit is scheduled.
+`POST /game/restart` takes no body and returns HTTP 202 after the current map
+accepts the restart request. It works during an active game and from the
+game-over screen. Poll `/game/status` until `phase` is `playing` and the new
+game has a nonzero `tileCount`. Restart discards the current run.
+
+`POST /game/pause` and `POST /game/resume` also take no body. They return the
+previous and current `timeScaleMode`. Resume always selects normal play speed,
+even if the game was previously fast-forwarding. Pausing does not open the
+pause menu, so snapshots remain available for an agent to inspect. Road edits
+accepted while paused remain scheduled until simulation resumes.
+
+The three bodyless control endpoints accept both explicitly framed empty
+requests (`Content-Length: 0`) and HTTP/1.1 POST requests that omit both
+`Content-Length` and `Transfer-Encoding`, including `curl -X POST`. This is a
+scoped compatibility exception for Mono's otherwise automatic HTTP 411
+response; JSON action endpoints still require normal request framing.
+
+Control responses are sent as complete, non-streamed JSON bodies and close the
+HTTP connection after each request. This avoids relying on persistent-connection
+flush behavior in Mono's `HttpListener` while a control action changes game state.
+
+`POST /actions/clear` takes `{"x": 5, "y": 7}` and returns HTTP 202 when the
+edit is scheduled.
+
+The optional state-changing smoke tests are explicit and never run as part of
+the default read-only validation:
+
+```powershell
+python tests/apitest.py --pause
+python tests/apitest.py --resume
+python tests/apitest.py --restart
+```
+
+## Agent and reinforcement-learning development status
+
+The API is currently suitable for manual debugging and early, low-frequency
+agent experiments. It is not yet a deterministic Gym-style environment.
+
+### P0: required for unattended agents
+
+- [ ] Give queued actions deadlines, request IDs, and idempotency. A request
+  that times out at the HTTP layer currently remains queued and may execute
+  after the client has already received HTTP 503.
+- [x] Allow restarting the current map without waiting for game over.
+- [x] Allow an agent to pause for observation and resume at normal speed.
+- [ ] Add a controlled run primitive. The initial design is to resume from a
+  paused state, advance by a requested amount of **simulation time**, pause at
+  the first eligible boundary, and return one snapshot. Wall-clock sleeps are
+  intentionally avoided because frame rate and HTTP latency make them
+  nondeterministic.
+- [ ] Complete the action space: weekly upgrade selection, traffic lights,
+  roundabouts, motorways, batch edits, and an explicit no-op.
+- [ ] Add episode and execution identity: `episodeId`, `simulationTick`,
+  `actionId`, final per-action results, and a terminal reason.
+- [ ] Expand observations for high-score play with map bounds and terrain,
+  vehicle or road-segment traffic load, motorway endpoints, and legal-action
+  masks.
+
+### P1: training reliability and throughput
+
+- [ ] Capture at most one immutable observation per simulation boundary and
+  move JSON serialization off the Unity main thread.
+- [ ] Add `/v1/health`, `/v1/version`, `/v1/capabilities`, and a versioned JSON
+  schema or OpenAPI contract.
+- [ ] Add replay determinism, timeout/idempotency, reset-loop, concurrency, and
+  long-running soak tests.
+- [ ] Support configurable ports and isolated configuration for multiple game
+  processes.
+
+### P2: repository and deployment hygiene
+
+- [ ] Replace machine-specific game paths and live-plugin output defaults in
+  the project file with an explicit `GameDir`/staging configuration.
+- [ ] Remove tracked IDE state, user project settings, old binaries, and
+  vendored package artifacts; restore dependencies during build instead.
+- [ ] Split the monolithic plugin into transport, game-control, snapshot, and
+  contract components, then add CI compile and contract validation.
 
 ## Current limitations
 
 - Road addition and clearing were verified in a running game: each command
   executed, changed both endpoint tiles, and adjusted the concrete count.
-  Restart is restricted to the game-over screen and still needs a live smoke test.
-- Additional upgrades, time control, and restart during an active game are not implemented.
+- Active-game restart and pause/resume were verified in a running game. Their
+  JSON response and bodyless-POST compatibility are covered by the API smoke
+  test options documented above.
+- Additional upgrades and controlled simulation-time stepping are not implemented.
 - The game phase is inferred from active UI screens and may be ambiguous during
   transitional loading frames.
 - Vehicle positions, complete lane paths, route costs, and ETA are not in the snapshot.
