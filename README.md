@@ -47,6 +47,7 @@ answers `OPTIONS` preflight requests and exposes the corresponding CORS headers.
 | `GET /tiles/count` | Tile count. |
 | `GET /destinations` | One entry per destination building, including `groupIndex`, demand state, footprint, and carpark coordinates. |
 | `GET /game/status` | Phase, score, clock, available resources, and readiness flags. |
+| `GET /requests?id=<requestId>` | Processing status and original HTTP result of a state-changing request. Does not confirm that a scheduled simulation edit executed. |
 | `POST /actions/road` | Add one road connection from `(x, y)` in `direction`. |
 | `POST /actions/clear` | Clear roads on tile `(x, y)`, respecting the game's permanence rules. |
 | `POST /game/restart` | Restart the current map from an active or game-over game. |
@@ -188,6 +189,16 @@ the simulation has already applied it. Read a later `/snapshot` to verify
 game's `resultCode`. Successful no-op edits return HTTP 200 with
 `scheduled: false`.
 
+State-changing requests may include `X-Request-Id` (letters, digits, `-`, `_`,
+`.` or `:`, up to 128 characters). The API echoes it in the response header.
+Retrying the same endpoint and exact body with the same ID replays the original
+result; reusing an ID for a different endpoint or body returns HTTP 409. If the
+header is omitted, the server assigns an ID, but clients cannot safely retry a
+request whose response was lost. A request still queued after five seconds is
+expired and will not execute later. If it had already started, HTTP 202 reports
+that processing is still underway; query `/requests?id=<requestId>` for its HTTP
+result. An HTTP result of `scheduled` still needs later simulation confirmation.
+
 `POST /game/restart` takes no body and returns HTTP 202 after the current map
 accepts the restart request. It works during an active game and from the
 game-over screen. Poll `/game/status` until `phase` is `playing` and the new
@@ -197,7 +208,10 @@ game has a nonzero `tileCount`. Restart discards the current run.
 previous and current `timeScaleMode`. Resume always selects normal play speed,
 even if the game was previously fast-forwarding. Pausing does not open the
 pause menu, so snapshots remain available for an agent to inspect. Road edits
-accepted while paused remain scheduled until simulation resumes.
+accepted while paused are scheduled and may execute on subsequent Unity updates
+even while the game clock remains frozen. Check a later snapshot for the actual
+road state. The immediate `changed` and `currentMode` response fields can still
+reflect the old mode; poll `/game/status` or `/snapshot` to confirm the switch.
 
 The three bodyless control endpoints accept both explicitly framed empty
 requests (`Content-Length: 0`) and HTTP/1.1 POST requests that omit both
@@ -219,7 +233,14 @@ the default read-only validation:
 python tests/apitest.py --pause
 python tests/apitest.py --resume
 python tests/apitest.py --restart
+python tests/apitest.py --check-request-id
 ```
+
+Run the separate read-only snapshot benchmark with
+`python tests/apitest.py --benchmark-snapshot 20`. It reports client HTTP latency and the
+server's `X-Snapshot-Capture-Ms` and `X-Snapshot-Serialize-Ms` measurements,
+plus response size. The server timings measure work on the Unity main thread;
+they do not include waiting for the next frame or network transfer.
 
 ## Agent and reinforcement-learning development status
 
@@ -228,23 +249,24 @@ agent experiments. It is not yet a deterministic Gym-style environment.
 
 ### P0: required for unattended agents
 
-- [ ] Give queued actions deadlines, request IDs, and idempotency. A request
-  that times out at the HTTP layer currently remains queued and may execute
-  after the client has already received HTTP 503.
+- [ ] Finish queued-action safety and final execution results. Request IDs,
+  replay, and cancellation of expired queued requests are implemented; the
+  main-thread timeout race still needs a runtime stress test.
 - [x] Allow restarting the current map without waiting for game over.
 - [x] Allow an agent to pause for observation and resume at normal speed.
-- [ ] Add a controlled run primitive. The initial design is to resume from a
-  paused state, advance by a requested amount of **simulation time**, pause at
-  the first eligible boundary, and return one snapshot. Wall-clock sleeps are
-  intentionally avoided because frame rate and HTTP latency make them
-  nondeterministic.
+- [ ] Add lightweight game events and two decision policies: an Agent can poll
+  events and pause when needed; an RL model can pause at a configurable minimum
+  **simulation-time** interval, with critical events allowed to interrupt it.
 - [ ] Complete the action space: weekly upgrade selection, traffic lights,
-  roundabouts, motorways, batch edits, and an explicit no-op.
+  roundabouts, motorways, and an explicit no-op. Road edits remain individual.
 - [ ] Add episode and execution identity: `episodeId`, `simulationTick`,
-  `actionId`, final per-action results, and a terminal reason.
+  `actionId`, and a terminal reason.
 - [ ] Expand observations for high-score play with map bounds and terrain,
   vehicle or road-segment traffic load, motorway endpoints, and legal-action
   masks.
+
+See the [P0 Agent/RL implementation plan](docs/p0-agent-rl-plan.md) for the
+agreed decision model, development order, and acceptance criteria.
 
 ### P1: training reliability and throughput
 
@@ -273,7 +295,7 @@ agent experiments. It is not yet a deterministic Gym-style environment.
 - Active-game restart and pause/resume were verified in a running game. Their
   JSON response and bodyless-POST compatibility are covered by the API smoke
   test options documented above.
-- Additional upgrades and controlled simulation-time stepping are not implemented.
+- Additional upgrades and event-driven decision boundaries are not implemented.
 - The game phase is inferred from active UI screens and may be ambiguous during
   transitional loading frames.
 - Vehicle positions, complete lane paths, route costs, and ETA are not in the snapshot.

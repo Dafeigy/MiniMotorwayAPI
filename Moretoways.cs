@@ -9,6 +9,8 @@ using Newtonsoft.Json;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Net;
 using System.Text;
@@ -21,14 +23,28 @@ namespace Moretoways
     [BepInPlugin("Nul4i.motoways.plugin", "Moretoways", "1.0.0")]
     public class Moretoways : BaseUnityPlugin
     {
+        private const string Logo =
+            "\n"+
+            "##::::'##::'#######::'########::'########:'########::'#######::'##:::::'##::::'###::::'##:::'##::'######::\n"+
+            "###::'###:'##.... ##: ##.... ##: ##.....::... ##..::'##.... ##: ##:'##: ##:::'## ##:::. ##:'##::'##... ##:\n"+
+            "####'####: ##:::: ##: ##:::: ##: ##:::::::::: ##:::: ##:::: ##: ##: ##: ##::'##:. ##:::. ####::: ##:::..::\n"+
+            "## ### ##: ##:::: ##: ########:: ######:::::: ##:::: ##:::: ##: ##: ##: ##:'##:::. ##:::. ##::::. ######::\n"+
+            "##. #: ##: ##:::: ##: ##.. ##::: ##...::::::: ##:::: ##:::: ##: ##: ##: ##: #########:::: ##:::::..... ##:\n"+
+            "##:.:: ##: ##:::: ##: ##::. ##:: ##:::::::::: ##:::: ##:::: ##: ##: ##: ##: ##.... ##:::: ##::::'##::: ##:\n"+
+            "##:::: ##:. #######:: ##:::. ##: ########:::: ##::::. #######::. ###. ###:: ##:::: ##:::: ##::::. ######::\n"+
+            "..:::::..:::.......:::..:::::..::........:::::..::::::.......::::...::...:::..:::::..:::::..::::::......:::";
         private const int Port = 9000;
         private const int RequestTimeoutMs = 5000;
+        private const int MaxRequestIdLength = 128;
         // Normal games otherwise consume a new value from Random.NextSimulationSeed()
         // every time they start. Keep this constant until a GUI/configuration surface
         // is added for choosing a seed at runtime.
         private const uint FixedSimulationSeed = 20261014u;
 
         private readonly ConcurrentQueue<SnapshotRequest> requests = new ConcurrentQueue<SnapshotRequest>();
+        private readonly Dictionary<string, SnapshotRequest> actionRequests =
+            new Dictionary<string, SnapshotRequest>(StringComparer.Ordinal);
+        private readonly object actionRequestsLock = new object();
         private HttpListener httpListener;
         private Thread httpThread;
         private volatile bool isRunning;
@@ -48,13 +64,78 @@ namespace Moretoways
         {
             public readonly string Path;
             public readonly string Body;
+            public readonly string RequestId;
+            private readonly long deadlineTimestamp;
+            // 0 = queued, 1 = running, 2 = complete, 3 = expired.
+            private int state;
             public readonly TaskCompletionSource<ApiResponse> Completion =
                 new TaskCompletionSource<ApiResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
 
-            public SnapshotRequest(string path, string body)
+            public SnapshotRequest(string path, string body, string requestId)
             {
                 Path = path;
                 Body = body;
+                RequestId = requestId;
+                deadlineTimestamp = Stopwatch.GetTimestamp() +
+                    Stopwatch.Frequency * RequestTimeoutMs / 1000;
+            }
+
+            public string State
+            {
+                get
+                {
+                    switch (Volatile.Read(ref state))
+                    {
+                        case 0: return "queued";
+                        case 1: return "running";
+                        case 2: return "complete";
+                        default: return "expired";
+                    }
+                }
+            }
+
+            public bool Matches(string path, string body)
+            {
+                return Path == path && string.Equals(Body, body, StringComparison.Ordinal);
+            }
+
+            public bool TryBegin()
+            {
+                if (Interlocked.CompareExchange(ref state, 1, 0) != 0)
+                    return false;
+
+                if (Stopwatch.GetTimestamp() < deadlineTimestamp)
+                    return true;
+
+                Interlocked.Exchange(ref state, 3);
+                Completion.TrySetResult(ExpiredResponse());
+                return false;
+            }
+
+            public bool TryExpire()
+            {
+                if (Interlocked.CompareExchange(ref state, 3, 0) != 0)
+                    return false;
+
+                Completion.TrySetResult(ExpiredResponse());
+                return true;
+            }
+
+            public void Complete(ApiResponse response)
+            {
+                Completion.TrySetResult(response);
+                Volatile.Write(ref state, 2);
+            }
+
+            private ApiResponse ExpiredResponse()
+            {
+                return new ApiResponse(503, JsonConvert.SerializeObject(new
+                {
+                    success = false,
+                    requestId = RequestId,
+                    state = "expired",
+                    error = "Game main thread did not start this request before its deadline"
+                }));
             }
         }
 
@@ -75,11 +156,16 @@ namespace Moretoways
         {
             public readonly int StatusCode;
             public readonly string Json;
+            public readonly double? SnapshotCaptureMs;
+            public readonly double? SnapshotSerializeMs;
 
-            public ApiResponse(int statusCode, string json)
+            public ApiResponse(int statusCode, string json,
+                double? snapshotCaptureMs = null, double? snapshotSerializeMs = null)
             {
                 StatusCode = statusCode;
                 Json = json;
+                SnapshotCaptureMs = snapshotCaptureMs;
+                SnapshotSerializeMs = snapshotSerializeMs;
             }
         }
 
@@ -128,6 +214,7 @@ namespace Moretoways
 
         private void Start()
         {
+            Logger.LogMessage(Logo);
             pluginInstance = this;
             Harmony.CreateAndPatchAll(typeof(Moretoways));
             StartHttpServer();
@@ -201,12 +288,33 @@ namespace Moretoways
                     return;
                 }
 
-                if (path != "/" && path != "/snapshot" && path != "/tiles" &&
+                if (path != "/" && path != "/snapshot" && path != "/requests" && path != "/tiles" &&
                     path != "/tiles/count" && path != "/destinations" &&
                     path != "/game/status" && !isAction)
                 {
                     SendJson(response, 404, "{\"error\":\"Not Found\"}");
                     return;
+                }
+
+                if (path == "/requests")
+                {
+                    SendRequestStatus(context.Request, response);
+                    return;
+                }
+
+                string requestId = null;
+                if (isAction)
+                {
+                    requestId = context.Request.Headers["X-Request-Id"];
+                    if (string.IsNullOrEmpty(requestId))
+                        requestId = Guid.NewGuid().ToString("N");
+                    else if (!IsValidRequestId(requestId))
+                    {
+                        SendJson(response, 400,
+                            "{\"success\":false,\"error\":\"Invalid X-Request-Id\"}");
+                        return;
+                    }
+                    response.Headers["X-Request-Id"] = requestId;
                 }
 
                 string body = null;
@@ -226,16 +334,64 @@ namespace Moretoways
                     }
                 }
 
-                var request = new SnapshotRequest(path, body);
-                requests.Enqueue(request);
+                SnapshotRequest request;
+                bool enqueue = true;
+                bool requestIdConflict = false;
+                if (isAction)
+                {
+                    lock (actionRequestsLock)
+                    {
+                        if (actionRequests.TryGetValue(requestId, out request))
+                        {
+                            if (!request.Matches(path, body))
+                                requestIdConflict = true;
+                            enqueue = false;
+                        }
+                        else
+                        {
+                            request = new SnapshotRequest(path, body, requestId);
+                            actionRequests.Add(requestId, request);
+                        }
+                    }
+                    if (requestIdConflict)
+                    {
+                        SendJson(response, 409,
+                            "{\"success\":false,\"error\":\"Request ID was used for a different action\"}");
+                        return;
+                    }
+                }
+                else
+                {
+                    request = new SnapshotRequest(path, body, null);
+                }
+
+                if (enqueue)
+                    requests.Enqueue(request);
                 if (!request.Completion.Task.Wait(RequestTimeoutMs))
                 {
-                    SendJson(response, 503, "{\"error\":\"Game main thread did not respond\"}");
+                    // A queued request can be cancelled safely. A request that
+                    // already started may still finish, so expose its identity
+                    // instead of reporting that the action was not executed.
+                    if (request.TryExpire() || request.Completion.Task.IsCompleted)
+                    {
+                        ApiResponse timedResult = request.Completion.Task.Result;
+                        SendApiResponse(response, timedResult);
+                        return;
+                    }
+
+                    SendJson(response, isAction ? 202 : 503, isAction
+                        ? JsonConvert.SerializeObject(new
+                        {
+                            success = true,
+                            requestId = requestId,
+                            state = request.State
+                        })
+                        : "{\"error\":\"Game main thread did not respond\"}");
                     return;
                 }
 
                 ApiResponse result = request.Completion.Task.Result;
-                SendJson(response, result.StatusCode, result.Json);
+                SendApiResponse(response, result);
             }
             catch (ObjectDisposedException)
             {
@@ -270,8 +426,59 @@ namespace Moretoways
         {
             response.Headers["Access-Control-Allow-Origin"] = "*";
             response.Headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS";
-            response.Headers["Access-Control-Allow-Headers"] = "Content-Type";
+            response.Headers["Access-Control-Allow-Headers"] = "Content-Type, X-Request-Id";
+            response.Headers["Access-Control-Expose-Headers"] =
+                "X-Request-Id, X-Snapshot-Capture-Ms, X-Snapshot-Serialize-Ms";
             response.Headers["Access-Control-Max-Age"] = "600";
+        }
+
+        private static bool IsValidRequestId(string requestId)
+        {
+            if (requestId.Length == 0 || requestId.Length > MaxRequestIdLength)
+                return false;
+
+            foreach (char character in requestId)
+            {
+                if ((character >= 'a' && character <= 'z') ||
+                    (character >= 'A' && character <= 'Z') ||
+                    (character >= '0' && character <= '9') ||
+                    character == '-' || character == '_' || character == '.' || character == ':')
+                    continue;
+                return false;
+            }
+            return true;
+        }
+
+        private void SendRequestStatus(HttpListenerRequest httpRequest, HttpListenerResponse response)
+        {
+            string requestId = httpRequest.QueryString["id"];
+            if (string.IsNullOrEmpty(requestId) || !IsValidRequestId(requestId))
+            {
+                SendJson(response, 400,
+                    "{\"success\":false,\"error\":\"Expected a valid id query parameter\"}");
+                return;
+            }
+
+            SnapshotRequest request;
+            lock (actionRequestsLock)
+                actionRequests.TryGetValue(requestId, out request);
+            if (request == null)
+            {
+                SendJson(response, 404,
+                    "{\"success\":false,\"error\":\"Unknown request ID\"}");
+                return;
+            }
+
+            ApiResponse result = request.Completion.Task.IsCompleted
+                ? request.Completion.Task.Result : null;
+            SendJson(response, 200, JsonConvert.SerializeObject(new
+            {
+                success = true,
+                requestId = requestId,
+                state = request.State,
+                responseStatusCode = result == null ? (int?)null : result.StatusCode,
+                response = result == null ? null : JsonConvert.DeserializeObject(result.Json)
+            }));
         }
 
         private static bool TrySendJson(HttpListenerResponse response, int statusCode, string json)
@@ -293,6 +500,17 @@ namespace Moretoways
             {
                 return false;
             }
+        }
+
+        private static void SendApiResponse(HttpListenerResponse response, ApiResponse result)
+        {
+            if (result.SnapshotCaptureMs.HasValue)
+                response.Headers["X-Snapshot-Capture-Ms"] =
+                    result.SnapshotCaptureMs.Value.ToString("F3", CultureInfo.InvariantCulture);
+            if (result.SnapshotSerializeMs.HasValue)
+                response.Headers["X-Snapshot-Serialize-Ms"] =
+                    result.SnapshotSerializeMs.Value.ToString("F3", CultureInfo.InvariantCulture);
+            SendJson(response, result.StatusCode, result.Json);
         }
 
         private static void SendJson(HttpListenerResponse response, int statusCode, string json)
@@ -323,33 +541,45 @@ namespace Moretoways
             }
 
             SnapshotRequest request;
-            if (!requests.TryDequeue(out request))
-                return;
+            // A paused game can leave several requests in the queue past their
+            // deadlines. Skip all expired entries in the same frame so they do
+            // not delay the next live request by one frame each.
+            do
+            {
+                if (!requests.TryDequeue(out request))
+                    return;
+            } while (!request.TryBegin());
 
             try
             {
                 // Game objects are copied on Unity's main thread. The HTTP thread
                 // receives JSON only and never accesses a live game object.
                 if (request.Path == "/actions/road")
-                    request.Completion.TrySetResult(AddRoad(request.Body));
+                    request.Complete(AddRoad(request.Body));
                 else if (request.Path == "/actions/clear")
-                    request.Completion.TrySetResult(ClearRoads(request.Body));
+                    request.Complete(ClearRoads(request.Body));
                 else if (request.Path == "/game/restart")
-                    request.Completion.TrySetResult(RestartGame());
+                    request.Complete(RestartGame());
                 else if (request.Path == "/game/pause")
-                    request.Completion.TrySetResult(SetGamePaused(true));
+                    request.Complete(SetGamePaused(true));
                 else if (request.Path == "/game/resume")
-                    request.Completion.TrySetResult(SetGamePaused(false));
+                    request.Complete(SetGamePaused(false));
                 else
                 {
+                    long captureStarted = Stopwatch.GetTimestamp();
                     GameSnapshot snapshot = CaptureSnapshot();
-                    request.Completion.TrySetResult(new ApiResponse(200, SerializeResponse(snapshot, request.Path)));
+                    long serializeStarted = Stopwatch.GetTimestamp();
+                    string json = SerializeResponse(snapshot, request.Path);
+                    long finished = Stopwatch.GetTimestamp();
+                    request.Complete(new ApiResponse(200, json,
+                        (serializeStarted - captureStarted) * 1000.0 / Stopwatch.Frequency,
+                        (finished - serializeStarted) * 1000.0 / Stopwatch.Frequency));
                 }
             }
             catch (Exception exception)
             {
                 Logger.LogError("Snapshot failed: " + exception);
-                request.Completion.TrySetResult(new ApiResponse(500,
+                request.Complete(new ApiResponse(500,
                     "{\"success\":false,\"error\":\"Snapshot failed\"}"));
             }
         }
@@ -946,8 +1176,7 @@ namespace Moretoways
 
             SnapshotRequest request;
             while (requests.TryDequeue(out request))
-                request.Completion.TrySetResult(new ApiResponse(503,
-                    "{\"success\":false,\"error\":\"Plugin stopped\"}"));
+                request.TryExpire();
 
             gridGameUI = null;
             gridTilemapView = null;

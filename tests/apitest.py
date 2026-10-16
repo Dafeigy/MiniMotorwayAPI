@@ -7,8 +7,10 @@ the game between edits. Uses only Python's standard library.
 import argparse
 import json
 import socket
+import statistics
 import sys
 import time
+import uuid
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
@@ -44,21 +46,27 @@ def check(condition, message):
         raise ValidationError(message)
 
 
-def request(base_url, path, *, body=None, method=None, expected_status=200, timeout=8):
+def request(base_url, path, *, body=None, method=None, expected_status=200,
+            timeout=8, headers=None, return_headers=False):
     data = None if body is None else json.dumps(body).encode("utf-8")
     request_method = method or ("POST" if data is not None else "GET")
+    request_headers = {"Content-Type": "application/json"} if data is not None else {}
+    if headers:
+        request_headers.update(headers)
     req = Request(
         base_url + path,
         data=data,
-        headers={"Content-Type": "application/json"} if data is not None else {},
+        headers=request_headers,
         method=request_method,
     )
     try:
         with urlopen(req, timeout=timeout) as response:
             status = response.status
+            response_headers = response.headers
             payload = json.load(response)
     except HTTPError as error:
         status = error.code
+        response_headers = error.headers
         try:
             payload = json.load(error)
         except (ValueError, UnicodeError):
@@ -69,7 +77,7 @@ def request(base_url, path, *, body=None, method=None, expected_status=200, time
         raise ValidationError(f"{path}: invalid JSON response: {error}") from error
     check(status == expected_status, f"{path}: HTTP {status}, expected {expected_status}: {payload}")
     check(isinstance(payload, dict), f"{path}: expected a JSON object")
-    return payload
+    return (payload, response_headers) if return_headers else payload
 
 
 def bodyless_post(base_url, path, *, expected_status=200, timeout=8):
@@ -325,8 +333,8 @@ def set_paused(base_url, paused):
     expected_mode = "Paused" if paused else "Play"
     result = bodyless_post(base_url, path)
     check(result.get("success") is True, f"{path}: operation failed: {result}")
-    check(result.get("currentMode") == expected_mode,
-          f"{path}: expected {expected_mode}, got {result.get('currentMode')}")
+    # The game applies the time-scale change after this HTTP response is
+    # created, so currentMode in the immediate response can still be old.
     observed = poll_snapshot(
         base_url, 2,
         lambda snapshot: snapshot.get("timeScaleMode") == expected_mode,
@@ -335,6 +343,54 @@ def set_paused(base_url, paused):
     print(json.dumps({"response": result, "snapshotId": observed["snapshotId"]},
                      ensure_ascii=False, indent=2))
     print(("PAUSE" if paused else "RESUME") + " PASS")
+
+
+def validate_request_lifecycle(base_url):
+    """State-changing opt-in check; leaves the game paused."""
+    initial = request(base_url, "/snapshot")
+    check(initial["phase"] == "playing", "Request ID check requires an active game")
+    request_id = uuid.uuid4().hex
+    headers = {"X-Request-Id": request_id}
+    first, response_headers = request(
+        base_url, "/game/pause", body={}, headers=headers, return_headers=True)
+    check(response_headers.get("X-Request-Id") == request_id,
+          "Pause response did not echo X-Request-Id")
+    duplicate = request(base_url, "/game/pause", body={}, headers=headers)
+    check(duplicate == first, "Duplicate request did not replay its original result")
+    record = request(base_url, f"/requests?id={request_id}")
+    check(record.get("state") == "complete", f"Request did not complete: {record}")
+    check(record.get("responseStatusCode") == 200, f"Wrong recorded response: {record}")
+    check(record.get("response") == first, "Recorded response differs from first result")
+    conflict = request(base_url, "/game/resume", body={}, headers=headers,
+                       expected_status=409)
+    check(conflict.get("success") is False, "Reused ID was not rejected")
+    print("REQUEST ID PASS (game remains paused)")
+
+
+def benchmark_snapshots(base_url, samples):
+    """Measure read-only snapshot costs reported by the plugin and client."""
+    check(1 <= samples <= 100, "Snapshot sample count must be between 1 and 100")
+    timings = {"captureMs": [], "serializeMs": [], "httpMs": [], "bytes": []}
+    for _ in range(samples):
+        started = time.perf_counter()
+        _, headers = request(base_url, "/snapshot", return_headers=True)
+        timings["httpMs"].append((time.perf_counter() - started) * 1000)
+        for key, header in (("captureMs", "X-Snapshot-Capture-Ms"),
+                            ("serializeMs", "X-Snapshot-Serialize-Ms")):
+            value = headers.get(header)
+            check(value is not None, f"/snapshot: missing {header}")
+            timings[key].append(float(value))
+        timings["bytes"].append(int(headers.get("Content-Length", "0")))
+
+    summary = {}
+    for key, values in timings.items():
+        sorted_values = sorted(values)
+        summary[key] = {
+            "median": round(statistics.median(sorted_values), 3),
+            "p95": round(sorted_values[(len(sorted_values) * 95 + 99) // 100 - 1], 3),
+            "max": round(sorted_values[-1], 3),
+        }
+    print(json.dumps({"samples": samples, "timings": summary}, indent=2))
 
 
 def restart_game(base_url, poll_timeout):
@@ -434,6 +490,10 @@ def main():
                          help="Resume the active game at normal speed")
     actions.add_argument("--restart", action="store_true",
                          help="Restart the current game (destructive)")
+    actions.add_argument("--check-request-id", action="store_true",
+                         help="Check idempotency via pause; leaves the game paused")
+    actions.add_argument("--benchmark-snapshot", type=int, metavar="N",
+                         help="Measure N read-only snapshot requests (1-100)")
     parser.add_argument("--poll-timeout", type=float, default=10,
                         help="Seconds to wait for each road edit (default: 10)")
     args = parser.parse_args()
@@ -463,6 +523,10 @@ def main():
             set_paused(base_url, False)
         elif args.restart:
             restart_game(base_url, args.poll_timeout)
+        elif args.check_request_id:
+            validate_request_lifecycle(base_url)
+        elif args.benchmark_snapshot is not None:
+            benchmark_snapshots(base_url, args.benchmark_snapshot)
     except ValidationError as error:
         print(f"FAIL: {error}", file=sys.stderr)
         return 1
