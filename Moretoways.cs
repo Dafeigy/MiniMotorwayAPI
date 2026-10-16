@@ -6,6 +6,7 @@ using Motorways.Commands;
 using Motorways.Models;
 using Motorways.Views;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -36,10 +37,9 @@ namespace Moretoways
         private const int Port = 9000;
         private const int RequestTimeoutMs = 5000;
         private const int MaxRequestIdLength = 128;
-        // Normal games otherwise consume a new value from Random.NextSimulationSeed()
-        // every time they start. Keep this constant until a GUI/configuration surface
-        // is added for choosing a seed at runtime.
+        // Fresh normal games retain the historical default seed.
         private const uint FixedSimulationSeed = 20261014u;
+        private const float NewGameLoadTimeoutSeconds = 30f;
 
         private readonly ConcurrentQueue<SnapshotRequest> requests = new ConcurrentQueue<SnapshotRequest>();
         private readonly Dictionary<string, SnapshotRequest> actionRequests =
@@ -53,6 +53,8 @@ namespace Moretoways
         private int editCommandsExecuted;
         private int lastScore;
         private ulong? initialSimulationSeed;
+        private ulong? nextGameSeed;
+        private NewGameLaunch newGameLaunch;
         private bool alwaysShowWorldGrid;
         private GameUIScreen gridGameUI;
         private TilemapView gridTilemapView;
@@ -152,6 +154,31 @@ namespace Moretoways
             public int? y { get; set; }
         }
 
+        private sealed class NewGameRequest
+        {
+            public string map { get; set; }
+            public uint? seed { get; set; }
+            public bool startPaused { get; set; }
+        }
+
+        private sealed class RestartGameRequest
+        {
+            public uint? seed { get; set; }
+        }
+
+        private sealed class NewGameLaunch
+        {
+            public GameStarter Starter;
+            public ScreenStack ScreenStack;
+            public Factory.IScope AppScope;
+            public string Map;
+            public uint Seed;
+            public string SourceScreen;
+            public float StartedAt;
+            public string State;
+            public string Error;
+        }
+
         private sealed class ApiResponse
         {
             public readonly int StatusCode;
@@ -194,6 +221,7 @@ namespace Moretoways
             public bool camera;
             public string timeScaleMode;
             public ulong? initialSeed;
+            public string map;
             public int? score;
             public object clock;
             public object resources;
@@ -280,7 +308,7 @@ namespace Moretoways
                 }
 
                 bool isAction = path == "/actions/road" || path == "/actions/clear" ||
-                    path == "/game/restart" || path == "/game/pause" ||
+                    path == "/game/new" || path == "/game/restart" || path == "/game/pause" ||
                     path == "/game/resume";
                 if (method != (isAction ? "POST" : "GET"))
                 {
@@ -290,7 +318,7 @@ namespace Moretoways
 
                 if (path != "/" && path != "/snapshot" && path != "/requests" && path != "/tiles" &&
                     path != "/tiles/count" && path != "/destinations" &&
-                    path != "/game/status" && !isAction)
+                    path != "/game/status" && path != "/game/maps" && !isAction)
                 {
                     SendJson(response, 404, "{\"error\":\"Not Found\"}");
                     return;
@@ -318,7 +346,8 @@ namespace Moretoways
                 }
 
                 string body = null;
-                if (path == "/actions/road" || path == "/actions/clear")
+                if (path == "/actions/road" || path == "/actions/clear" ||
+                    path == "/game/new" || path == "/game/restart")
                 {
                     if (context.Request.ContentLength64 > 4096)
                     {
@@ -540,6 +569,8 @@ namespace Moretoways
                 ToggleWorldGridMode();
             }
 
+            AdvanceNewGameLaunch();
+
             SnapshotRequest request;
             // A paused game can leave several requests in the queue past their
             // deadlines. Skip all expired entries in the same frame so they do
@@ -559,11 +590,15 @@ namespace Moretoways
                 else if (request.Path == "/actions/clear")
                     request.Complete(ClearRoads(request.Body));
                 else if (request.Path == "/game/restart")
-                    request.Complete(RestartGame());
+                    request.Complete(RestartGame(request.Body));
+                else if (request.Path == "/game/new")
+                    request.Complete(StartNewGame(request.Body));
                 else if (request.Path == "/game/pause")
                     request.Complete(SetGamePaused(true));
                 else if (request.Path == "/game/resume")
                     request.Complete(SetGamePaused(false));
+                else if (request.Path == "/game/maps")
+                    request.Complete(GetGameMaps());
                 else
                 {
                     long captureStarted = Stopwatch.GetTimestamp();
@@ -767,15 +802,222 @@ namespace Moretoways
             }));
         }
 
-        private ApiResponse RestartGame()
+        private bool TryGetGameNavigation(out ScreenStack screenStack,
+            out Factory.IScope appScope, out string screenName)
         {
+            // Prefer the visible screen: inactive screens can remain in the stack.
+            UnityEngine.Component screen = UnityEngine.Object.FindObjectOfType<GameOverScreen>();
+            if (screen == null)
+                screen = UnityEngine.Object.FindObjectOfType<GameUIScreen>();
+            if (screen == null)
+                screen = UnityEngine.Object.FindObjectOfType<MapSelectScreen>();
+            if (screen == null)
+                screen = UnityEngine.Object.FindObjectOfType<MainMenuScreen>();
+
+            screenStack = screen == null ? null :
+                Traverse.Create(screen).Field("_screenStack").GetValue<ScreenStack>();
+            appScope = screen == null ? null :
+                Traverse.Create(screen).Field("_appScope").GetValue<Factory.IScope>();
+            var topScreen = screenStack == null ? null : screenStack.GetTopVisibleScreen();
+            screenName = topScreen is GameContainerScreen ? nameof(GameUIScreen) :
+                topScreen == null ? null : topScreen.GetType().Name;
+            return screenStack != null && appScope != null;
+        }
+
+        private ApiResponse GetGameMaps()
+        {
+            ScreenStack screenStack;
+            Factory.IScope appScope;
+            string screenName;
+            if (!TryGetGameNavigation(out screenStack, out appScope, out screenName))
+                return new ApiResponse(503,
+                    "{\"success\":false,\"error\":\"Game menu services are unavailable\"}");
+
+            MapDatabase database = appScope.Get<MapDatabase>();
+            if (database == null || database.MapLibrary == null)
+                return new ApiResponse(503,
+                    "{\"success\":false,\"error\":\"Map library is unavailable\"}");
+
+            var maps = new List<object>();
+            foreach (MapDefinition map in database.MapLibrary.Maps)
+                maps.Add(new { map = map.cityName, name = map.mapName });
+            return new ApiResponse(200, JsonConvert.SerializeObject(new { success = true, maps = maps }));
+        }
+
+        private ApiResponse StartNewGame(string body)
+        {
+            NewGameRequest input;
+            try
+            {
+                JObject payload = JObject.Parse(body);
+                JToken value;
+                if (payload.TryGetValue("map", out value) && value.Type != JTokenType.String ||
+                    payload.TryGetValue("seed", out value) &&
+                    value.Type != JTokenType.Integer && value.Type != JTokenType.Null ||
+                    payload.TryGetValue("startPaused", out value) &&
+                    value.Type != JTokenType.Boolean)
+                    return new ApiResponse(400,
+                        "{\"success\":false,\"error\":\"Invalid map, seed or startPaused type\"}");
+                input = JsonConvert.DeserializeObject<NewGameRequest>(body);
+            }
+            catch (JsonException)
+            {
+                return new ApiResponse(400, "{\"success\":false,\"error\":\"Invalid JSON or seed\"}");
+            }
+            if (input == null || string.IsNullOrWhiteSpace(input.map))
+                return new ApiResponse(400,
+                    "{\"success\":false,\"error\":\"Expected map (cityName)\"}");
+            if (newGameLaunch != null &&
+                (newGameLaunch.State == "loading" || newGameLaunch.State == "starting" ||
+                 newGameLaunch.State == "initializing"))
+                return new ApiResponse(409,
+                    "{\"success\":false,\"error\":\"A new game is already starting\"}");
+            if (nextGameSeed.HasValue)
+                return new ApiResponse(409,
+                    "{\"success\":false,\"error\":\"A game restart is already starting\"}");
+
+            ScreenStack screenStack;
+            Factory.IScope appScope;
+            string screenName;
+            if (!TryGetGameNavigation(out screenStack, out appScope, out screenName))
+                return new ApiResponse(503,
+                    "{\"success\":false,\"error\":\"Game menu services are unavailable\"}");
+            if (screenName == nameof(GameOverScreen))
+                return new ApiResponse(409,
+                    "{\"success\":false,\"error\":\"Exit the game-over screen before starting a new map\"}");
+            var topScreen = screenStack.GetTopVisibleScreen();
+            bool canReplace = screenName == nameof(GameUIScreen) &&
+                topScreen is GameContainerScreen ||
+                screenName == nameof(MapSelectScreen) && topScreen is MapSelectScreen;
+            bool canPush = screenName == nameof(MainMenuScreen) &&
+                topScreen is MainMenuScreen;
+            if (!canReplace && !canPush)
+                return new ApiResponse(409,
+                    "{\"success\":false,\"error\":\"Wait for the menu or game screen to settle\"}");
+
+            MapDatabase database = appScope.Get<MapDatabase>();
+            MapDefinition map = database == null || database.MapLibrary == null ? null :
+                database.MapLibrary.GetMapByName(input.map);
+            if (map == null)
+                return new ApiResponse(404, JsonConvert.SerializeObject(new
+                {
+                    success = false, error = "Unknown map", map = input.map
+                }));
+
+            var starter = new GameStarter(this);
+            bool replaceTopScreen = canReplace;
+            if (!starter.StartFromMapDefinition(map, GameMode.Normal, 0f,
+                replaceTopScreen, input.startPaused))
+                return new ApiResponse(503,
+                    "{\"success\":false,\"error\":\"Could not load map\"}");
+
+            newGameLaunch = new NewGameLaunch
+            {
+                Starter = starter,
+                ScreenStack = screenStack,
+                AppScope = appScope,
+                Map = map.cityName,
+                Seed = input.seed ?? FixedSimulationSeed,
+                SourceScreen = topScreen.GetType().Name,
+                StartedAt = Time.realtimeSinceStartup,
+                State = "loading"
+            };
+            return new ApiResponse(202, JsonConvert.SerializeObject(new
+            {
+                success = true, resultCode = "NewGameLoading",
+                map = newGameLaunch.Map, seed = newGameLaunch.Seed,
+                startPaused = input.startPaused
+            }));
+        }
+
+        private void AdvanceNewGameLaunch()
+        {
+            NewGameLaunch launch = newGameLaunch;
+            if (launch == null || launch.State == "ready" || launch.State == "failed")
+                return;
+            if (Time.realtimeSinceStartup - launch.StartedAt > NewGameLoadTimeoutSeconds)
+            {
+                nextGameSeed = null;
+                launch.State = "failed";
+                launch.Error = "Timed out while starting the new game";
+                Logger.LogError(launch.Error + " on " + launch.Map);
+                return;
+            }
+            if (launch.State != "loading" || !launch.Starter.CanStart)
+                return;
+
+            var topScreen = launch.ScreenStack.GetTopVisibleScreen();
+            if (topScreen == null || topScreen.GetType().Name != launch.SourceScreen)
+            {
+                launch.State = "failed";
+                launch.Error = "Screen changed while the map was loading";
+                return;
+            }
+
+            try
+            {
+                nextGameSeed = launch.Seed;
+                launch.State = "starting";
+                if (!launch.Starter.Start(launch.ScreenStack, launch.AppScope))
+                {
+                    nextGameSeed = null;
+                    launch.State = "failed";
+                    launch.Error = "The game rejected the new map";
+                }
+            }
+            catch (Exception exception)
+            {
+                nextGameSeed = null;
+                launch.State = "failed";
+                launch.Error = "Could not start the new map";
+                Logger.LogError(launch.Error + ": " + exception);
+            }
+        }
+
+        private ApiResponse RestartGame(string body)
+        {
+            RestartGameRequest input = null;
+            if (!string.IsNullOrWhiteSpace(body))
+            {
+                try
+                {
+                    JObject payload = JObject.Parse(body);
+                    JToken value;
+                    if (payload.TryGetValue("seed", out value) &&
+                        value.Type != JTokenType.Integer && value.Type != JTokenType.Null)
+                        return new ApiResponse(400,
+                            "{\"success\":false,\"error\":\"Invalid seed type\"}");
+                    input = payload.ToObject<RestartGameRequest>();
+                }
+                catch (JsonException)
+                {
+                    return new ApiResponse(400,
+                        "{\"success\":false,\"error\":\"Invalid JSON or seed\"}");
+                }
+            }
+            if (newGameLaunch != null &&
+                (newGameLaunch.State == "loading" || newGameLaunch.State == "starting" ||
+                 newGameLaunch.State == "initializing") || nextGameSeed.HasValue)
+                return new ApiResponse(409,
+                    "{\"success\":false,\"error\":\"A game is already starting\"}");
+
+            ulong? seed = input != null && input.seed.HasValue ?
+                (ulong?)input.seed.Value : initialSimulationSeed;
+            if (!seed.HasValue)
+                return new ApiResponse(409,
+                    "{\"success\":false,\"error\":\"Current game seed is unavailable\"}");
+
             var gameOver = UnityEngine.Object.FindObjectOfType<GameOverScreen>();
             if (gameOver != null)
             {
-                gameOver.OnRestart();
+                nextGameSeed = seed;
+                try { gameOver.OnRestart(); }
+                catch { nextGameSeed = null; throw; }
                 tilemap = null;
-                return new ApiResponse(202,
-                    "{\"success\":true,\"resultCode\":\"RestartRequested\"}");
+                return new ApiResponse(202, JsonConvert.SerializeObject(new
+                {
+                    success = true, resultCode = "RestartRequested", seed = seed.Value
+                }));
             }
 
             var gameUI = UnityEngine.Object.FindObjectOfType<GameUIScreen>();
@@ -798,9 +1040,14 @@ namespace Moretoways
                 return new ApiResponse(503,
                     "{\"success\":false,\"error\":\"Could not open the game restart screen\"}");
 
-            Traverse.Create(pauseScreen).Method("RestartGame").GetValue();
+            nextGameSeed = seed;
+            try { Traverse.Create(pauseScreen).Method("RestartGame").GetValue(); }
+            catch { nextGameSeed = null; throw; }
             tilemap = null;
-            return new ApiResponse(202, "{\"success\":true,\"resultCode\":\"RestartRequested\"}");
+            return new ApiResponse(202, JsonConvert.SerializeObject(new
+            {
+                success = true, resultCode = "RestartRequested", seed = seed.Value
+            }));
         }
 
         private static ApiResponse SetGamePaused(bool paused)
@@ -852,6 +1099,10 @@ namespace Moretoways
                     snapshot.score = lastScore;
                 return snapshot;
             }
+
+            var currentGame = Traverse.Create(gameUI).Field("_game").GetValue<MotorwaysGame>();
+            if (currentGame != null && currentGame.MapDefinition != null)
+                snapshot.map = currentGame.MapDefinition.cityName;
 
             // The view's model is the current game's tilemap. The Harmony hook
             // remains a fallback for frames in which the view has not bound yet.
@@ -915,6 +1166,10 @@ namespace Moretoways
             }
 
             snapshot.tileCount = snapshot.tiles.Count;
+            if (newGameLaunch != null && newGameLaunch.State == "initializing" &&
+                snapshot.map == newGameLaunch.Map && snapshot.initialSeed == newGameLaunch.Seed &&
+                snapshot.tileCount > 0)
+                newGameLaunch.State = "ready";
             return snapshot;
         }
 
@@ -1120,7 +1375,7 @@ namespace Moretoways
             return counts;
         }
 
-        private static string SerializeResponse(GameSnapshot snapshot, string path)
+        private string SerializeResponse(GameSnapshot snapshot, string path)
         {
             switch (path)
             {
@@ -1157,9 +1412,16 @@ namespace Moretoways
                         phase = snapshot.phase, gameUI = snapshot.gameUI,
                         tilemapView = snapshot.tilemapView, camera = snapshot.camera,
                         timeScaleMode = snapshot.timeScaleMode,
-                        initialSeed = snapshot.initialSeed,
+                        initialSeed = snapshot.initialSeed, map = snapshot.map,
                         tileCount = snapshot.tileCount, score = snapshot.score,
                         clock = snapshot.clock, resources = snapshot.resources,
+                        newGame = newGameLaunch == null ? null : new
+                        {
+                            map = newGameLaunch.Map,
+                            seed = newGameLaunch.Seed,
+                            state = newGameLaunch.State,
+                            error = newGameLaunch.Error
+                        },
                         timestamp = snapshot.timestamp
                     });
                 default:
@@ -1207,22 +1469,60 @@ namespace Moretoways
         [HarmonyPrefix, HarmonyPatch(typeof(InitCityCommand), "CreateNormalCity")]
         private static void UseFixedSimulationSeed(ref uint seed)
         {
-            seed = FixedSimulationSeed;
             if (pluginInstance != null)
-                pluginInstance.Logger.LogInfo("Using fixed simulation seed " + seed);
+            {
+                bool requested = pluginInstance.nextGameSeed.HasValue &&
+                    pluginInstance.nextGameSeed.Value <= uint.MaxValue;
+                seed = requested ?
+                    (uint)pluginInstance.nextGameSeed.Value : FixedSimulationSeed;
+                pluginInstance.Logger.LogInfo((requested ? "Using requested simulation seed " :
+                    "Using fixed simulation seed ") + seed);
+            }
+            else
+                seed = FixedSimulationSeed;
         }
 
         [HarmonyPrefix, HarmonyPatch(typeof(InitCityCommand), "Initialize")]
-        private static void CaptureInitialSimulationSeed(ulong seed)
+        private static void CaptureInitialSimulationSeed(ref ulong seed)
         {
             if (pluginInstance != null)
             {
+                if (pluginInstance.nextGameSeed.HasValue)
+                {
+                    seed = pluginInstance.nextGameSeed.Value;
+                    pluginInstance.nextGameSeed = null;
+                }
                 // snapshotId identifies captures within one game. Reset it at
                 // the city initialization boundary so API restarts, UI
                 // restarts, and newly started games all begin at snapshot 1.
                 pluginInstance.snapshotId = 0;
                 pluginInstance.initialSimulationSeed = seed;
+                if (pluginInstance.newGameLaunch != null &&
+                    pluginInstance.newGameLaunch.State == "ready")
+                    pluginInstance.newGameLaunch = null;
+                if (pluginInstance.newGameLaunch != null &&
+                    pluginInstance.newGameLaunch.State == "starting" &&
+                    seed == pluginInstance.newGameLaunch.Seed)
+                    pluginInstance.newGameLaunch.State = "initializing";
             }
+        }
+
+        [HarmonyPrefix, HarmonyPatch(typeof(PauseScreen), "RestartGame")]
+        private static void PreserveSeedOnPauseRestart()
+        {
+            PreserveSeedOnUiRestart();
+        }
+
+        [HarmonyPrefix, HarmonyPatch(typeof(GameOverScreen), nameof(GameOverScreen.OnRestart))]
+        private static void PreserveSeedOnGameOverRestart()
+        {
+            PreserveSeedOnUiRestart();
+        }
+
+        private static void PreserveSeedOnUiRestart()
+        {
+            if (pluginInstance != null && !pluginInstance.nextGameSeed.HasValue)
+                pluginInstance.nextGameSeed = pluginInstance.initialSimulationSeed;
         }
 
         [HarmonyPrefix, HarmonyPatch(typeof(HttpListenerRequest), "FinishInitialization")]

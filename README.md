@@ -47,16 +47,18 @@ answers `OPTIONS` preflight requests and exposes the corresponding CORS headers.
 | `GET /tiles/count` | Tile count. |
 | `GET /destinations` | One entry per destination building, including `groupIndex`, demand state, footprint, and carpark coordinates. |
 | `GET /game/status` | Phase, score, clock, available resources, and readiness flags. |
+| `GET /game/maps` | Available map identifiers (`cityName`) and display names. |
 | `GET /requests?id=<requestId>` | Processing status and original HTTP result of a state-changing request. Does not confirm that a scheduled simulation edit executed. |
 | `POST /actions/road` | Add one road connection from `(x, y)` in `direction`. |
 | `POST /actions/clear` | Clear roads on tile `(x, y)`, respecting the game's permanence rules. |
-| `POST /game/restart` | Restart the current map from an active or game-over game. |
+| `POST /game/restart` | Restart the current map from an active or game-over game, optionally choosing a seed. |
+| `POST /game/new` | Start a new normal game with a chosen map, seed, and optional paused state. |
 | `POST /game/pause` | Pause simulation while leaving the game board available for observation. |
 | `POST /game/resume` | Resume simulation at normal speed. |
 
 `/snapshot` includes a `snapshotId` that starts at 1 for each new game and
 increases monotonically until the next game starts, plus a UTC timestamp,
-phase (`menu`, `playing`, or `gameOver`), time scale mode, score, clock, available upgrades, and
+phase (`menu`, `playing`, or `gameOver`), `map` (`cityName`), time scale mode, score, clock, available upgrades, and
 `editCommandsExecuted` (a diagnostic count of simulation edit commands), and
 tile and vehicle lists. Each tile contains its coordinates, content type and type-specific
 data, directional road states, and traffic light / roundabout information.
@@ -143,11 +145,45 @@ the same vehicle returns to its owning house. See the
 [snapshot development roadmap](docs/snapshot-roadmap.md) for the detailed
 semantics, completed phases, and intentionally deferred pathfinding data.
 
-Normal games use the fixed simulation seed `20261014`. The seed actually used
+New normal games use the fixed simulation seed `20261014` unless `/game/new`
+supplies a seed. A restart reuses the current game's seed unless
+`/game/restart` supplies one. The seed actually used
 to initialize the current game is returned as `initialSeed` by `/snapshot` and
-`/game/status`. Daily and weekly challenge seeds are left unchanged. Changing
-the constant requires rebuilding the plugin; runtime configuration is planned
-for a later GUI/configuration update.
+`/game/status`. Daily and weekly challenge starts retain their game-defined
+seeds; restarting them also reuses the current seed by default.
+
+`GET /game/maps` lists the exact, case-sensitive `map` values accepted by
+`POST /game/new`. The installed game version defines these city identifiers
+(`None` is not a playable map):
+
+| `map` value | `map` value | `map` value | `map` value |
+| --- | --- | --- | --- |
+| `LosAngeles` | `Beijing` | `MexicoCity` | `DarEsSalaam` |
+| `Moscow` | `Tokyo` | `Munich` | `Manila` |
+| `Zurich` | `RioDeJaneiro` | `Dubai` | `Wellington` |
+| `Warsaw` | `ChiangMai` | `Lisbon` | `Busan` |
+
+Use `GET /game/maps` to confirm which of these maps are present in the running
+game. For example:
+
+```powershell
+$maps = Invoke-RestMethod http://localhost:9000/game/maps
+$maps.maps
+$body = @{ map = 'LosAngeles'; seed = 12345; startPaused = $true } | ConvertTo-Json
+Invoke-RestMethod http://localhost:9000/game/new -Method Post -ContentType 'application/json' -Body $body
+Invoke-RestMethod http://localhost:9000/game/status
+```
+
+The request requires `map`; `seed` is an optional unsigned 32-bit integer
+(`0` to `4294967295`), and `startPaused` defaults to `false`. It starts a
+normal-mode game and discards the current run. It can be called from the main
+menu, map selection screen, or an active game screen. Exit the game-over screen
+first. HTTP 202 means map loading was accepted. Poll `/game/status`:
+`newGame.state` moves through `loading`, `starting`, `initializing`, and `ready`,
+or becomes `failed` with an `error`. Confirm `phase: "playing"`, the requested
+`map` and `initialSeed`, and `tileCount > 0` before taking actions. A map load
+that does not complete within 30 seconds fails. A new start request returns
+HTTP 409 while another is in progress.
 
 When the game is not updating its main thread, a request returns HTTP 503 after
 five seconds. A valid snapshot with `tileCount: 0` means that no current tilemap
@@ -199,10 +235,14 @@ expired and will not execute later. If it had already started, HTTP 202 reports
 that processing is still underway; query `/requests?id=<requestId>` for its HTTP
 result. An HTTP result of `scheduled` still needs later simulation confirmation.
 
-`POST /game/restart` takes no body and returns HTTP 202 after the current map
-accepts the restart request. It works during an active game and from the
-game-over screen. Poll `/game/status` until `phase` is `playing` and the new
-game has a nonzero `tileCount`. Restart discards the current run.
+`POST /game/restart` accepts an optional JSON body such as `{"seed":12345}`.
+`seed` must be an unsigned 32-bit integer (`0` to `4294967295`); without it,
+the current game's `initialSeed` is reused. Bodyless POSTs remain supported.
+The HTTP 202 response includes the selected `seed`. It works during an active
+game and from the game-over screen. Poll `/game/status` until `phase` is
+`playing`, `initialSeed` matches the selected seed, and `tileCount` is nonzero.
+Restart discards the current run. The game's own restart controls also preserve
+the current seed.
 
 `POST /game/pause` and `POST /game/resume` also take no body. They return the
 previous and current `timeScaleMode`. Resume always selects normal play speed,
@@ -233,6 +273,8 @@ the default read-only validation:
 python tests/apitest.py --pause
 python tests/apitest.py --resume
 python tests/apitest.py --restart
+python tests/apitest.py --restart --seed 12345
+python tests/apitest.py --new-game LosAngeles --seed 12345 --start-paused --poll-timeout 35
 python tests/apitest.py --check-request-id
 ```
 

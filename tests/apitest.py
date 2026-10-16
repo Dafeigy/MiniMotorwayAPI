@@ -154,6 +154,7 @@ def validate_read_api(base_url):
     preflight = request(base_url, "/game/pause", method="OPTIONS")
     snapshot = request(base_url, "/snapshot")
     status = request(base_url, "/game/status")
+    maps_response = request(base_url, "/game/maps")
     tiles_response = request(base_url, "/tiles")
     count_response = request(base_url, "/tiles/count")
     destinations_response = request(base_url, "/destinations")
@@ -174,6 +175,10 @@ def validate_read_api(base_url):
     check(status.get("success") is True
           and status.get("phase") in {"menu", "playing", "gameOver"},
           "/game/status: invalid phase")
+    maps = maps_response.get("maps")
+    check(maps_response.get("success") is True and isinstance(maps, list)
+          and all(isinstance(item.get("map"), str) and item["map"]
+                  for item in maps), "/game/maps: invalid map list")
     check(tiles_response.get("count") == len(tiles_response.get("tiles", [])),
           "/tiles: count mismatch")
     check(isinstance(count_response.get("count"), int), "/tiles/count: invalid count")
@@ -294,6 +299,8 @@ def validate_read_api(base_url):
         "editCommandsExecuted": snapshot["editCommandsExecuted"],
         "score": snapshot.get("score"),
         "initialSeed": snapshot.get("initialSeed"),
+        "map": snapshot.get("map"),
+        "availableMaps": len(maps),
         "tileCount": snapshot["tileCount"],
         "vehicleCount": snapshot.get("vehicleCount"),
         "destinations": len(destinations),
@@ -393,17 +400,27 @@ def benchmark_snapshots(base_url, samples):
     print(json.dumps({"samples": samples, "timings": summary}, indent=2))
 
 
-def restart_game(base_url, poll_timeout):
+def restart_game(base_url, seed, poll_timeout):
     initial = request(base_url, "/snapshot")
     check(initial["phase"] in {"playing", "gameOver"},
           "Restart requires an active or game-over game")
-    result = bodyless_post(base_url, "/game/restart", expected_status=202)
+    if seed is None:
+        result = bodyless_post(base_url, "/game/restart", expected_status=202)
+        expected_seed = initial.get("initialSeed")
+    else:
+        check(0 <= seed <= 0xFFFFFFFF, "--seed must be a uint32 value")
+        result = request(base_url, "/game/restart", body={"seed": seed},
+                         expected_status=202)
+        expected_seed = seed
     check(result.get("success") is True, f"Restart was not accepted: {result}")
+    check(result.get("seed") == expected_seed,
+          f"Restart accepted a different seed: {result}")
     restarted = poll_snapshot(
         base_url, poll_timeout,
         lambda snapshot: snapshot.get("phase") == "playing"
         and snapshot.get("snapshotId", 0) <= 5
-        and snapshot.get("tileCount", 0) > 0,
+        and snapshot.get("tileCount", 0) > 0
+        and snapshot.get("initialSeed") == expected_seed,
         "a fresh playable game",
     )
     print(json.dumps({
@@ -413,6 +430,36 @@ def restart_game(base_url, poll_timeout):
         "tileCount": restarted["tileCount"],
     }, ensure_ascii=False, indent=2))
     print("RESTART PASS")
+
+
+def start_new_game(base_url, map_name, seed, start_paused, poll_timeout):
+    maps = request(base_url, "/game/maps")["maps"]
+    check(map_name in {item["map"] for item in maps},
+          f"Unknown map {map_name}; use GET /game/maps for valid names")
+    payload = {"map": map_name, "startPaused": start_paused}
+    if seed is not None:
+        check(0 <= seed <= 0xFFFFFFFF, "--seed must be a uint32 value")
+        payload["seed"] = seed
+    result = request(base_url, "/game/new", body=payload, expected_status=202)
+    check(result.get("success") is True, f"New game was not accepted: {result}")
+    deadline = time.monotonic() + poll_timeout
+    while True:
+        status = request(base_url, "/game/status")
+        launch = status.get("newGame") or {}
+        check(launch.get("state") != "failed", f"New game failed: {launch}")
+        if launch.get("state") == "ready":
+            check(status.get("phase") == "playing" and status.get("tileCount", 0) > 0,
+                  f"New game is not playable: {status}")
+            check(status.get("map") == map_name and
+                  status.get("initialSeed") == result["seed"],
+                  f"New game map or seed differs: {status}")
+            print(json.dumps({"response": result, "status": status},
+                             ensure_ascii=False, indent=2))
+            print("NEW GAME PASS")
+            return
+        if time.monotonic() >= deadline:
+            raise ValidationError(f"Timed out waiting for new game: {launch}")
+        time.sleep(0.2)
 
 
 def add_road(base_url, x, y, direction, poll_timeout):
@@ -490,14 +537,25 @@ def main():
                          help="Resume the active game at normal speed")
     actions.add_argument("--restart", action="store_true",
                          help="Restart the current game (destructive)")
+    actions.add_argument("--new-game", metavar="MAP",
+                         help="Start a new normal game on MAP (discards the current run)")
     actions.add_argument("--check-request-id", action="store_true",
                          help="Check idempotency via pause; leaves the game paused")
     actions.add_argument("--benchmark-snapshot", type=int, metavar="N",
                          help="Measure N read-only snapshot requests (1-100)")
-    parser.add_argument("--poll-timeout", type=float, default=10,
-                        help="Seconds to wait for each road edit (default: 10)")
+    parser.add_argument("--poll-timeout", type=float, default=35,
+                        help="Seconds to wait for an action (default: 35)")
+    parser.add_argument("--seed", type=int,
+                        help="uint32 seed for --restart or --new-game")
+    parser.add_argument("--start-paused", action="store_true",
+                        help="Start --new-game paused")
     args = parser.parse_args()
     try:
+        check(args.poll_timeout > 0, "--poll-timeout must be positive")
+        check(args.seed is None or args.restart or args.new_game,
+              "--seed requires --restart or --new-game")
+        check(args.new_game or not args.start_paused,
+              "--start-paused requires --new-game")
         base_url = args.base_url.rstrip("/")
         validate_read_api(base_url)
         selected = args.add_road or args.clear_road or args.inspect_road
@@ -522,7 +580,10 @@ def main():
         elif args.resume:
             set_paused(base_url, False)
         elif args.restart:
-            restart_game(base_url, args.poll_timeout)
+            restart_game(base_url, args.seed, args.poll_timeout)
+        elif args.new_game:
+            start_new_game(base_url, args.new_game, args.seed,
+                           args.start_paused, args.poll_timeout)
         elif args.check_request_id:
             validate_request_lifecycle(base_url)
         elif args.benchmark_snapshot is not None:
