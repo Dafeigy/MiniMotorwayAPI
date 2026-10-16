@@ -154,6 +154,7 @@ def validate_read_api(base_url):
     preflight = request(base_url, "/game/pause", method="OPTIONS")
     snapshot = request(base_url, "/snapshot")
     status = request(base_url, "/game/status")
+    upgrades_response = request(base_url, "/game/upgrades")
     maps_response = request(base_url, "/game/maps")
     tiles_response = request(base_url, "/tiles")
     count_response = request(base_url, "/tiles/count")
@@ -172,9 +173,39 @@ def validate_read_api(base_url):
     check(isinstance(vehicles, list), "/snapshot: missing vehicles")
     check(snapshot.get("vehicleCount") == len(vehicles),
           "/snapshot: vehicle count mismatch")
+    motorways = snapshot.get("motorways")
+    check(isinstance(motorways, list) and
+          snapshot.get("motorwayCount") == len(motorways),
+          "/snapshot: motorway count mismatch")
+    motorway_ids = [motorway.get("motorwayId") for motorway in motorways]
+    check(all(isinstance(motorway_id, int) for motorway_id in motorway_ids)
+          and len(motorway_ids) == len(set(motorway_ids)),
+          "/snapshot: missing or duplicate motorway ID")
+    for motorway in motorways:
+        check(isinstance(motorway.get("hasConsumedUpgrade"), bool),
+              "/snapshot: invalid motorway upgrade state")
+        for endpoint in ("start", "end"):
+            coordinates = motorway.get(endpoint + "Coordinates")
+            check(isinstance(coordinates, dict) and
+                  all(isinstance(coordinates.get(axis), int) for axis in ("x", "y"))
+                  and motorway.get(endpoint + "Direction") in DIRECTIONS,
+                  f"/snapshot: invalid motorway {endpoint} endpoint")
     check(status.get("success") is True
           and status.get("phase") in {"menu", "playing", "gameOver"},
           "/game/status: invalid phase")
+    check(upgrades_response.get("success") is True
+          and isinstance(upgrades_response.get("pending"), bool)
+          and isinstance(upgrades_response.get("ready"), bool)
+          and isinstance(upgrades_response.get("pendingCount"), int)
+          and isinstance(upgrades_response.get("options"), list),
+          "/game/upgrades: invalid response")
+    for option in upgrades_response["options"]:
+        check(isinstance(option.get("optionIndex"), int)
+              and isinstance(option.get("type"), str)
+              and isinstance(option.get("amount"), int)
+              and isinstance(option.get("additionalConcrete"), int)
+              and isinstance(option.get("selectable"), bool),
+              "/game/upgrades: invalid option")
     maps = maps_response.get("maps")
     check(maps_response.get("success") is True and isinstance(maps, list)
           and all(isinstance(item.get("map"), str) and item["map"]
@@ -303,7 +334,9 @@ def validate_read_api(base_url):
         "availableMaps": len(maps),
         "tileCount": snapshot["tileCount"],
         "vehicleCount": snapshot.get("vehicleCount"),
+        "motorwayCount": snapshot.get("motorwayCount"),
         "destinations": len(destinations),
+        "pendingUpgrades": upgrades_response.get("pendingCount"),
         "resources": snapshot.get("resources"),
     }, ensure_ascii=False, indent=2))
     return snapshot

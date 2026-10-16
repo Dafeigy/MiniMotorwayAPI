@@ -4,6 +4,7 @@ using HarmonyLib;
 using Motorways;
 using Motorways.Commands;
 using Motorways.Models;
+using Motorways.Processes;
 using Motorways.Views;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
@@ -152,6 +153,22 @@ namespace Moretoways
         {
             public int? x { get; set; }
             public int? y { get; set; }
+            public string type { get; set; }
+        }
+
+        private sealed class MotorwayRequest
+        {
+            public int? startX { get; set; }
+            public int? startY { get; set; }
+            public string startDirection { get; set; }
+            public int? endX { get; set; }
+            public int? endY { get; set; }
+            public string endDirection { get; set; }
+        }
+
+        private sealed class UpgradeChoiceRequest
+        {
+            public int? optionIndex { get; set; }
         }
 
         private sealed class NewGameRequest
@@ -227,6 +244,8 @@ namespace Moretoways
             public object resources;
             public int vehicleCount;
             public List<VehicleSnapshot> vehicles = new List<VehicleSnapshot>();
+            public int motorwayCount;
+            public List<MotorwaySnapshot> motorways = new List<MotorwaySnapshot>();
             public int tileCount;
             public List<TileSnapshot> tiles = new List<TileSnapshot>();
         }
@@ -238,6 +257,18 @@ namespace Moretoways
             public string houseBuildingId;
             public string destinationBuildingId;
             public string lastVisitedDestinationBuildingId;
+        }
+
+        private sealed class MotorwaySnapshot
+        {
+            public int motorwayId;
+            public int number;
+            public string state;
+            public bool hasConsumedUpgrade;
+            public object startCoordinates;
+            public string startDirection;
+            public object endCoordinates;
+            public string endDirection;
         }
 
         private void Start()
@@ -308,6 +339,9 @@ namespace Moretoways
                 }
 
                 bool isAction = path == "/actions/road" || path == "/actions/clear" ||
+                    path == "/actions/traffic-light" || path == "/actions/roundabout" ||
+                    path == "/actions/motorway" || path == "/actions/upgrade" ||
+                    path == "/actions/noop" ||
                     path == "/game/new" || path == "/game/restart" || path == "/game/pause" ||
                     path == "/game/resume";
                 if (method != (isAction ? "POST" : "GET"))
@@ -318,7 +352,8 @@ namespace Moretoways
 
                 if (path != "/" && path != "/snapshot" && path != "/requests" && path != "/tiles" &&
                     path != "/tiles/count" && path != "/destinations" &&
-                    path != "/game/status" && path != "/game/maps" && !isAction)
+                    path != "/game/status" && path != "/game/maps" &&
+                    path != "/game/upgrades" && !isAction)
                 {
                     SendJson(response, 404, "{\"error\":\"Not Found\"}");
                     return;
@@ -347,6 +382,8 @@ namespace Moretoways
 
                 string body = null;
                 if (path == "/actions/road" || path == "/actions/clear" ||
+                    path == "/actions/traffic-light" || path == "/actions/roundabout" ||
+                    path == "/actions/motorway" || path == "/actions/upgrade" ||
                     path == "/game/new" || path == "/game/restart")
                 {
                     if (context.Request.ContentLength64 > 4096)
@@ -589,6 +626,16 @@ namespace Moretoways
                     request.Complete(AddRoad(request.Body));
                 else if (request.Path == "/actions/clear")
                     request.Complete(ClearRoads(request.Body));
+                else if (request.Path == "/actions/traffic-light")
+                    request.Complete(AddTrafficLight(request.Body));
+                else if (request.Path == "/actions/roundabout")
+                    request.Complete(AddRoundabout(request.Body));
+                else if (request.Path == "/actions/motorway")
+                    request.Complete(AddMotorway(request.Body));
+                else if (request.Path == "/actions/upgrade")
+                    request.Complete(SelectUpgrade(request.Body));
+                else if (request.Path == "/actions/noop")
+                    request.Complete(NoOp());
                 else if (request.Path == "/game/restart")
                     request.Complete(RestartGame(request.Body));
                 else if (request.Path == "/game/new")
@@ -599,6 +646,8 @@ namespace Moretoways
                     request.Complete(SetGamePaused(false));
                 else if (request.Path == "/game/maps")
                     request.Complete(GetGameMaps());
+                else if (request.Path == "/game/upgrades")
+                    request.Complete(GetUpgradeChoices());
                 else
                 {
                     long captureStarted = Stopwatch.GetTimestamp();
@@ -748,13 +797,231 @@ namespace Moretoways
             if (input == null || !input.x.HasValue || !input.y.HasValue)
                 return new ApiResponse(400, "{\"success\":false,\"error\":\"Expected x and y\"}");
 
+            TileEditor.ClearTileOfType clearType = TileEditor.ClearTileOfType.Roads;
+            if (input.type != null &&
+                (!Enum.TryParse(input.type, true, out clearType) ||
+                 !Enum.IsDefined(typeof(TileEditor.ClearTileOfType), clearType)))
+                return new ApiResponse(400,
+                    "{\"success\":false,\"error\":\"Invalid clear type\"}");
+
             return ApplyTileEdit((editor, view) => editor.ClearTileExplicit(
                 view, new Vector2Int(input.x.Value, input.y.Value),
-                TileEditor.ClearTileOfType.Roads,
+                clearType,
                 Tile.TileChangePermissions.RespectPermanence));
         }
 
-        private ApiResponse ApplyTileEdit(Func<TileEditor, TilemapView, TileEditResult> createEdit)
+        private ApiResponse AddTrafficLight(string body)
+        {
+            ClearRequest input;
+            try { input = JsonConvert.DeserializeObject<ClearRequest>(body); }
+            catch (JsonException)
+            {
+                return new ApiResponse(400, "{\"success\":false,\"error\":\"Invalid JSON\"}");
+            }
+            if (input == null || !input.x.HasValue || !input.y.HasValue)
+                return new ApiResponse(400,
+                    "{\"success\":false,\"error\":\"Expected x and y\"}");
+
+            return ApplyTileEdit((editor, view) => editor.AddTrafficLight(
+                view, new Vector2Int(input.x.Value, input.y.Value)));
+        }
+
+        private ApiResponse AddRoundabout(string body)
+        {
+            ClearRequest input;
+            try { input = JsonConvert.DeserializeObject<ClearRequest>(body); }
+            catch (JsonException)
+            {
+                return new ApiResponse(400, "{\"success\":false,\"error\":\"Invalid JSON\"}");
+            }
+            if (input == null || !input.x.HasValue || !input.y.HasValue)
+                return new ApiResponse(400,
+                    "{\"success\":false,\"error\":\"Expected x and y\"}");
+
+            return ApplyTileEdit((editor, view) => editor.AddRoundabout(
+                view, new Vector2Int(input.x.Value, input.y.Value)));
+        }
+
+        private ApiResponse AddMotorway(string body)
+        {
+            MotorwayRequest input;
+            try { input = JsonConvert.DeserializeObject<MotorwayRequest>(body); }
+            catch (JsonException)
+            {
+                return new ApiResponse(400, "{\"success\":false,\"error\":\"Invalid JSON\"}");
+            }
+
+            TileDirection startDirection;
+            TileDirection endDirection;
+            if (input == null || !input.startX.HasValue || !input.startY.HasValue ||
+                !input.endX.HasValue || !input.endY.HasValue ||
+                !Enum.TryParse(input.startDirection, true, out startDirection) ||
+                !Enum.TryParse(input.endDirection, true, out endDirection) ||
+                (int)startDirection < 0 || (int)startDirection > 7 ||
+                (int)endDirection < 0 || (int)endDirection > 7)
+            {
+                return new ApiResponse(400,
+                    "{\"success\":false,\"error\":\"Expected two coordinates and compass directions\"}");
+            }
+
+            var start = new Vector2Int(input.startX.Value, input.startY.Value);
+            var end = new Vector2Int(input.endX.Value, input.endY.Value);
+            if (start == end)
+                return new ApiResponse(400,
+                    "{\"success\":false,\"error\":\"Motorway endpoints must differ\"}");
+
+            City city = null;
+            int motorwayId = -1;
+            int motorwayNumber = 0;
+            // The native interaction first schedules an unbuilt anchor. That
+            // edit consumes the motorway asset; the finished edit marks the
+            // new motorway as already paid for. Skipping the anchor would
+            // leave the asset available after construction.
+            ApiResponse anchorResponse = ApplyTileEdit((editor, view) =>
+            {
+                var scope = Traverse.Create(view).Field("_scope").GetValue<Factory.IScope>();
+                city = scope == null ? null : scope.Get<City>();
+                if (city == null)
+                    throw new InvalidOperationException("City is unavailable");
+                motorwayId = city.NextMotorwayId;
+                motorwayNumber = view.GetLowestAvailableMotorwayNumber();
+                var candidate = editor.AddMotorway(view, motorwayId, motorwayNumber,
+                    start, startDirection, end, endDirection, -1);
+                if (!candidate.IsSuccessful)
+                    return candidate;
+                if (candidate.edit != null)
+                    scope.Release(candidate.edit);
+                return editor.AddUnbuiltMotorway(view, motorwayId, motorwayNumber, start);
+            }, () =>
+            {
+                if (city.GetNextMotorwayIdAndIncrement() != motorwayId)
+                    throw new InvalidOperationException("Motorway ID changed before applying the edit");
+            });
+            if (anchorResponse.StatusCode != 202)
+                return anchorResponse;
+
+            return ApplyTileEdit((editor, view) => editor.AddMotorway(view,
+                motorwayId, motorwayNumber, start, startDirection, end, endDirection, -1));
+        }
+
+        private static ApiResponse NoOp()
+        {
+            if (UnityEngine.Object.FindObjectOfType<GameUIScreen>() == null &&
+                UnityEngine.Object.FindObjectOfType<GameUpgradeScreen>() == null)
+                return new ApiResponse(409,
+                    "{\"success\":false,\"error\":\"No active game\"}");
+            return new ApiResponse(200,
+                "{\"success\":true,\"scheduled\":false,\"resultCode\":\"NoOp\"}");
+        }
+
+        private static bool TryGetUpgradeState(out GameUpgradeScreen upgradeScreen,
+            out UpgradeDatabaseModel database, out int[] buttonMapping)
+        {
+            upgradeScreen = UnityEngine.Object.FindObjectOfType<GameUpgradeScreen>();
+            var gameUI = UnityEngine.Object.FindObjectOfType<GameUIScreen>();
+            var source = (UnityEngine.Component)upgradeScreen ?? gameUI;
+            var simulation = source == null ? null :
+                Traverse.Create(source).Field("_simulation").GetValue<Server.ISimulation>();
+            database = simulation == null ? null : simulation.GetModel<UpgradeDatabaseModel>();
+            buttonMapping = upgradeScreen == null ? null :
+                Traverse.Create(upgradeScreen).Field("_buttonIndexToUpgradeIndex").GetValue<int[]>();
+            return database != null;
+        }
+
+        private static bool UpgradeScreenIsReady(GameUpgradeScreen screen, int[] mapping)
+        {
+            return screen != null && mapping != null &&
+                !screen.IsTransitioningIn() && !screen.IsTransitioningOut() &&
+                Traverse.Create(screen).Field("_delayTimer").GetValue<float>() < 0f &&
+                !Traverse.Create(screen).Field("_hasPopped").GetValue<bool>();
+        }
+
+        private static ApiResponse GetUpgradeChoices()
+        {
+            GameUpgradeScreen screen;
+            UpgradeDatabaseModel database;
+            int[] mapping;
+            bool available = TryGetUpgradeState(out screen, out database, out mapping);
+            bool pending = available && database.pendingUpgradeChoices.Count > 0;
+            var options = new List<object>();
+            if (pending)
+            {
+                var choices = database.pendingUpgradeChoices[0].choices;
+                for (int i = 0; i < choices.Count; i++)
+                {
+                    var package = choices[i];
+                    options.Add(new
+                    {
+                        optionIndex = i,
+                        type = package.type.ToString(),
+                        amount = package.amount,
+                        additionalConcrete = package.additionalConcrete,
+                        selectable = mapping != null && Array.IndexOf(mapping, i) >= 0
+                    });
+                }
+            }
+            return new ApiResponse(200, JsonConvert.SerializeObject(new
+            {
+                success = true,
+                pending = pending,
+                pendingCount = available ? database.pendingUpgradeChoices.Count : 0,
+                ready = pending && UpgradeScreenIsReady(screen, mapping),
+                options = options
+            }));
+        }
+
+        private static ApiResponse SelectUpgrade(string body)
+        {
+            UpgradeChoiceRequest input;
+            try { input = JsonConvert.DeserializeObject<UpgradeChoiceRequest>(body); }
+            catch (JsonException)
+            {
+                return new ApiResponse(400, "{\"success\":false,\"error\":\"Invalid JSON\"}");
+            }
+            if (input == null || !input.optionIndex.HasValue || input.optionIndex.Value < 0)
+                return new ApiResponse(400,
+                    "{\"success\":false,\"error\":\"Expected nonnegative optionIndex\"}");
+
+            GameUpgradeScreen screen;
+            UpgradeDatabaseModel database;
+            int[] mapping;
+            if (!TryGetUpgradeState(out screen, out database, out mapping) ||
+                database.pendingUpgradeChoices.Count == 0)
+                return new ApiResponse(409,
+                    "{\"success\":false,\"error\":\"No upgrade choice is pending\"}");
+            if (!UpgradeScreenIsReady(screen, mapping))
+                return new ApiResponse(409,
+                    "{\"success\":false,\"error\":\"Upgrade screen is not ready\"}");
+
+            var choices = database.pendingUpgradeChoices[0].choices;
+            int optionIndex = input.optionIndex.Value;
+            if (optionIndex >= choices.Count || Array.IndexOf(mapping, optionIndex) < 0)
+                return new ApiResponse(422,
+                    "{\"success\":false,\"error\":\"Upgrade option is unavailable\"}");
+
+            int buttonIndex = Array.IndexOf(mapping, optionIndex);
+            int previousChoicesMade = database.numChoicesMade;
+            int previousPendingCount = database.pendingUpgradeChoices.Count;
+            var selected = choices[optionIndex];
+            screen.OnUpgradeSelect(buttonIndex);
+            if (database.numChoicesMade == previousChoicesMade &&
+                database.pendingUpgradeChoices.Count == previousPendingCount)
+                return new ApiResponse(409,
+                    "{\"success\":false,\"error\":\"Game did not accept upgrade selection\"}");
+            return new ApiResponse(202, JsonConvert.SerializeObject(new
+            {
+                success = true,
+                scheduled = true,
+                resultCode = "Scheduled",
+                optionIndex = optionIndex,
+                type = selected.type.ToString(),
+                amount = selected.amount,
+                additionalConcrete = selected.additionalConcrete
+            }));
+        }
+
+        private ApiResponse ApplyTileEdit(Func<TileEditor, TilemapView, TileEditResult> createEdit,
+            Action beforeApply = null)
         {
             var gameUI = UnityEngine.Object.FindObjectOfType<GameUIScreen>();
             var tilemapView = gameUI == null ? null :
@@ -776,15 +1043,29 @@ namespace Moretoways
 
             TileEditResult result = createEdit(editor, tilemapView);
             if (!result.IsSuccessful)
+            {
+                if (result.edit != null)
+                    scope.Release(result.edit);
                 return new ApiResponse(422, JsonConvert.SerializeObject(new
                 {
                     success = false,
                     resultCode = result.resultCode.ToString(),
                     errorPosition = new { x = result.errorPosition.x, y = result.errorPosition.y }
                 }));
+            }
 
             if (result.edit == null)
                 return new ApiResponse(200, "{\"success\":true,\"scheduled\":false,\"resultCode\":\"NoChange\"}");
+
+            if (beforeApply != null)
+            {
+                try { beforeApply(); }
+                catch
+                {
+                    scope.Release(result.edit);
+                    throw;
+                }
+            }
 
             // Match MotorwaysPlayerAction.AddTileEdit(Immediate): add the client
             // edit to the tile views, schedule the simulation command, then
@@ -1153,6 +1434,31 @@ namespace Moretoways
 
             if (tilemap != null)
             {
+                var motorways = Traverse.Create(tilemap).Field("_motorways")
+                    .GetValue<Dictionary<int, MotorwayModel>>();
+                if (motorways != null)
+                {
+                    foreach (var entry in motorways)
+                    {
+                        MotorwayModel motorway = entry.Value;
+                        if (motorway == null)
+                            continue;
+                        Vector2Int start = motorway.StartCoordinates;
+                        Vector2Int end = motorway.EndCoordinates;
+                        snapshot.motorways.Add(new MotorwaySnapshot
+                        {
+                            motorwayId = motorway.Id,
+                            number = motorway.Number,
+                            state = motorway.State.ToString(),
+                            hasConsumedUpgrade = motorway.hasConsumedUpgrade,
+                            startCoordinates = new { x = start.x, y = start.y },
+                            startDirection = motorway.StartDirection.ToString(),
+                            endCoordinates = new { x = end.x, y = end.y },
+                            endDirection = motorway.EndDirection.ToString()
+                        });
+                    }
+                    snapshot.motorways.Sort((left, right) => left.motorwayId.CompareTo(right.motorwayId));
+                }
                 var tiles = Traverse.Create(tilemap).Field("_tiles")
                     .GetValue<Dictionary<Vector2Int, TileModel>>();
                 if (tiles != null)
@@ -1165,6 +1471,7 @@ namespace Moretoways
                 }
             }
 
+            snapshot.motorwayCount = snapshot.motorways.Count;
             snapshot.tileCount = snapshot.tiles.Count;
             if (newGameLaunch != null && newGameLaunch.State == "initializing" &&
                 snapshot.map == newGameLaunch.Map && snapshot.initialSeed == newGameLaunch.Seed &&
@@ -1547,7 +1854,8 @@ namespace Moretoways
 
             int queryIndex = rawUrl.IndexOf('?');
             string path = queryIndex < 0 ? rawUrl : rawUrl.Substring(0, queryIndex);
-            if (path != "/game/pause" && path != "/game/resume" && path != "/game/restart")
+            if (path != "/game/pause" && path != "/game/resume" &&
+                path != "/game/restart" && path != "/actions/noop")
                 return;
 
             Traverse request = Traverse.Create(__instance);

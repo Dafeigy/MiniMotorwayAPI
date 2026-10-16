@@ -1,8 +1,9 @@
 # Moretoways
 
 BepInEx plugin for observing and controlling a running Mini Motorways game
-through a local HTTP API. Road edits, road clearing, active-game restart, and
-pause/resume are implemented; stepping and other upgrades are still under development.
+through a local HTTP API. Road and facility edits, motorway creation, weekly
+upgrade selection, active-game restart, and pause/resume are implemented.
+Simulation-time decision boundaries and final action receipts are still under development.
 
 ## Build
 
@@ -50,10 +51,16 @@ answers `OPTIONS` preflight requests and exposes the corresponding CORS headers.
 | `GET /tiles/count` | Tile count. |
 | `GET /destinations` | One entry per destination building, including `groupIndex`, demand state, footprint, and carpark coordinates. |
 | `GET /game/status` | Phase, score, clock, available resources, and readiness flags. |
+| `GET /game/upgrades` | Pending weekly upgrade choices and whether the selection screen is ready. |
 | `GET /game/maps` | Available map identifiers (`cityName`) and display names. |
 | `GET /requests?id=<requestId>` | Processing status and original HTTP result of a state-changing request. Does not confirm that a scheduled simulation edit executed. |
 | `POST /actions/road` | Add one road connection from `(x, y)` in `direction`. |
-| `POST /actions/clear` | Clear roads on tile `(x, y)`, respecting the game's permanence rules. |
+| `POST /actions/clear` | Clear roads or a specified facility type on tile `(x, y)`, respecting permanence rules. |
+| `POST /actions/traffic-light` | Add a traffic light on a tile. |
+| `POST /actions/roundabout` | Add a roundabout on a tile. |
+| `POST /actions/motorway` | Add a motorway between two endpoint tiles. |
+| `POST /actions/upgrade` | Select a pending weekly upgrade option. |
+| `POST /actions/noop` | Explicitly record a decision without an edit. |
 | `POST /game/restart` | Restart the current map from an active or game-over game, optionally choosing a seed. |
 | `POST /game/new` | Start a new normal game with a chosen map, seed, and optional paused state. |
 | `POST /game/pause` | Pause simulation while leaving the game board available for observation. |
@@ -63,7 +70,7 @@ answers `OPTIONS` preflight requests and exposes the corresponding CORS headers.
 increases monotonically until the next game starts, plus a UTC timestamp,
 phase (`menu`, `playing`, or `gameOver`), `map` (`cityName`), time scale mode, score, clock, available upgrades, and
 `editCommandsExecuted` (a diagnostic count of simulation edit commands), and
-tile and vehicle lists. Each tile contains its coordinates, content type and type-specific
+tile, vehicle, and motorway lists. Each tile contains its coordinates, content type and type-specific
 data, directional road states, and traffic light / roundabout information.
 Destination buildings occupy multiple tiles; tiles sharing a `buildingId`
 represent one building. `/destinations` returns each building once.
@@ -302,8 +309,10 @@ agent experiments. It is not yet a deterministic Gym-style environment.
 - [ ] Add lightweight game events and two decision policies: an Agent can poll
   events and pause when needed; an RL model can pause at a configurable minimum
   **simulation-time** interval, with critical events allowed to interrupt it.
-- [ ] Complete the action space: weekly upgrade selection, traffic lights,
-  roundabouts, motorways, and an explicit no-op. Road edits remain individual.
+- [ ] Validate the expanded action space in a running game: weekly upgrade
+  selection, traffic lights, roundabouts, and an explicit no-op have been
+  exercised; the revised two-stage motorway edit awaits a game restart.
+  Road edits remain individual.
 - [ ] Add episode and execution identity: `episodeId`, `simulationTick`,
   `actionId`, and a terminal reason.
 - [ ] Expand observations for high-score play with map bounds and terrain,
@@ -312,6 +321,8 @@ agent experiments. It is not yet a deterministic Gym-style environment.
 
 See the [P0 Agent/RL implementation plan](docs/p0-agent-rl-plan.md) for the
 agreed decision model, development order, and acceptance criteria.
+The [Silicon Rider Bench comparison](docs/silicon-rider-lessons.md) explains
+the action and observation design behind that plan.
 
 ### P1: training reliability and throughput
 
@@ -340,7 +351,11 @@ agreed decision model, development order, and acceptance criteria.
 - Active-game restart and pause/resume were verified in a running game. Their
   JSON response and bodyless-POST compatibility are covered by the API smoke
   test options documented above.
-- Additional upgrades and event-driven decision boundaries are not implemented.
+- Weekly upgrade selection, traffic-light and roundabout placement, typed
+  clearing, and no-op were verified in a disposable running game. A first
+  motorway test exposed missing asset consumption; the two-stage fix compiles
+  but still needs a restart and runtime retest. Event-driven decision
+  boundaries are not implemented.
 - The game phase is inferred from active UI screens and may be ambiguous during
   transitional loading frames.
 - Vehicle positions, complete lane paths, route costs, and ETA are not in the snapshot.
