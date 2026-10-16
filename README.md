@@ -34,6 +34,9 @@ time Mini Motorways starts.
 
 ## Read API
 
+See the [complete API reference](docs/api.md) for all implemented paths,
+parameters, response fields, status codes, and request lifecycle rules.
+
 The listener accepts requests on `localhost:9000`.
 Each request is passed to Unity's main thread; the server
 thread never reads live Unity or game objects.
@@ -196,7 +199,7 @@ the game is open. It uses only the standard library:
 python tests/apitest.py
 ```
 
-The default run checks all five read endpoints without changing the game. It
+The default run checks all six read endpoints without changing the game. It
 also verifies demand totals, per-group counts, vehicle IDs and references,
 house vehicle counts, and the relationship between assigned demand and
 outbound vehicles.

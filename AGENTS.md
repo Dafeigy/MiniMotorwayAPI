@@ -2,6 +2,15 @@
 
 These instructions apply to the `MiniMotorwayAPI` repository.
 
+## API documentation
+
+`docs/api.md` is the reference for the currently implemented local HTTP API.
+Whenever a change adds, removes, or changes an endpoint, request field, response
+field, status code, header, or behavior, update `docs/api.md` in the same change.
+Keep the README API overview and examples consistent with that document. Verify
+the documentation against the route handlers and snapshot serialization code;
+do not document planned endpoints as implemented.
+
 ## Build and validation
 
 After changing plugin code:
