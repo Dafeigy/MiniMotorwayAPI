@@ -7,12 +7,14 @@ Simulation-time decision boundaries and final action receipts are still under de
 
 ## Build
 
-The project currently references the local Mono game and BepInEx assemblies in
-`Moretoways.csproj`. Update those paths if the game is installed elsewhere.
-Override `OutputPath` to build without writing directly into the game directory:
+The build requires an explicit Mini Motorways installation directory through
+the `GameDir` MSBuild property or `MINI_MOTORWAYS_DIR` environment variable.
+Build output stays inside the repository by default. NuGet restores
+Newtonsoft.Json into the normal global package cache; dependencies are not
+vendored in this repository.
 
 ```powershell
-dotnet msbuild Moretoways.csproj /t:Build /p:Configuration=Debug /p:OutputPath=bin\Debug\
+dotnet msbuild Moretoways.csproj /restore /t:Build /p:GameDir="F:\SteamLibrary\steamapps\common\Mini Motorways" /p:Configuration=Release /p:OutputPath=bin\DeployRelease\
 ```
 
 Copy the built `Moretoways.dll` and `Newtonsoft.Json.dll` into the game's
@@ -54,6 +56,10 @@ answers `OPTIONS` preflight requests and exposes the corresponding CORS headers.
 | `GET /game/upgrades` | Pending weekly upgrade choices and whether the selection screen is ready. |
 | `GET /game/maps` | Available map identifiers (`cityName`) and display names. |
 | `GET /requests?id=<requestId>` | Processing status and original HTTP result of a state-changing request. Does not confirm that a scheduled simulation edit executed. |
+| `GET /actions?id=<actionId>` | Final action state and native simulation execution time. |
+| `GET /events?after=<eventId>` | Bounded lightweight event log; does not capture a full snapshot. |
+| `GET /decision/status` | Agent/RL policy configuration and pending decision boundary. |
+| `POST /actions/legal` | Check one candidate action without scheduling it. |
 | `POST /actions/road` | Add one road connection from `(x, y)` in `direction`. |
 | `POST /actions/clear` | Clear roads or a specified facility type on tile `(x, y)`, respecting permanence rules. |
 | `POST /actions/traffic-light` | Add a traffic light on a tile. |
@@ -61,17 +67,21 @@ answers `OPTIONS` preflight requests and exposes the corresponding CORS headers.
 | `POST /actions/motorway` | Add a motorway between two endpoint tiles. |
 | `POST /actions/upgrade` | Select a pending weekly upgrade option. |
 | `POST /actions/noop` | Explicitly record a decision without an edit. |
+| `POST /decision/config` | Configure event-driven Agent or simulation-time RL pauses. |
 | `POST /game/restart` | Restart the current map from an active or game-over game, optionally choosing a seed. |
 | `POST /game/new` | Start a new normal game with a chosen map, seed, and optional paused state. |
 | `POST /game/pause` | Pause simulation while leaving the game board available for observation. |
 | `POST /game/resume` | Resume simulation at normal speed. |
 
 `/snapshot` includes a `snapshotId` that starts at 1 for each new game and
-increases monotonically until the next game starts, plus a UTC timestamp,
+increases monotonically until the next game starts, an `episodeId` that remains
+stable for that game, the native `simulationTick` and `simulationTime`, plus a UTC timestamp,
 phase (`menu`, `playing`, or `gameOver`), `map` (`cityName`), time scale mode, score, clock, available upgrades, and
-`editCommandsExecuted` (a diagnostic count of simulation edit commands), and
+terminal reason, `editCommandsExecuted` (a diagnostic count of simulation edit commands), and
 tile, vehicle, and motorway lists. Each tile contains its coordinates, content type and type-specific
-data, directional road states, and traffic light / roundabout information.
+data, directional road states, terrain flags, per-road-chunk traffic load, and
+traffic light / roundabout information. The snapshot also exposes full and
+currently playable map bounds.
 Destination buildings occupy multiple tiles; tiles sharing a `buildingId`
 represent one building. `/destinations` returns each building once.
 `groupIndex` is the stable identifier to use for matching houses and
@@ -245,6 +255,29 @@ expired and will not execute later. If it had already started, HTTP 202 reports
 that processing is still underway; query `/requests?id=<requestId>` for its HTTP
 result. An HTTP result of `scheduled` still needs later simulation confirmation.
 
+Every registered state-changing request also receives an `actionId`. Query
+`GET /actions?id=<actionId>` for `queued`, `scheduled`, `executed`, `rejected`,
+or `expired`. Tile edits are marked executed only after their native
+`EditTileCommand` returns and include the execution tick and simulation time.
+Successful motorway actions track both native edit commands. Starting or
+restarting a game records the resulting `episodeId`; queued actions from the
+previous episode expire instead of leaking into the new game. The server keeps
+the most recent 4096 request/action records.
+
+`GET /events?after=<eventId>` returns a bounded log of new houses,
+destinations, upgrade choices, overcrowding warnings/starts, terminal state,
+and RL interval boundaries. Events in the same native simulation tick are
+merged. Event IDs remain monotonic for the plugin process and do not reset on
+restart, so the bounded buffer can contain events from prior episodes; clients
+use each event's `episodeId` to separate runs. This endpoint and
+`GET /decision/status` are lightweight: neither
+captures a full snapshot. `POST /decision/config` selects `off`, `agent`, or
+`rl` mode, a minimum simulation-time interval, and critical event reasons that
+should pause early. A triggered boundary pauses after the simulation update
+and reuses one immutable snapshot until the decision changes state or resumes.
+`POST /actions/legal` checks one road, facility, motorway, upgrade, or no-op
+candidate with the game's native rules without scheduling a simulation command.
+
 `POST /game/restart` accepts an optional JSON body such as `{"seed":12345}`.
 `seed` must be an unsigned 32-bit integer (`0` to `4294967295`); without it,
 the current game's `initialSeed` is reused. Bodyless POSTs remain supported.
@@ -286,6 +319,8 @@ python tests/apitest.py --restart
 python tests/apitest.py --restart --seed 12345
 python tests/apitest.py --new-game LosAngeles --seed 12345 --start-paused --poll-timeout 35
 python tests/apitest.py --check-request-id
+python tests/apitest.py --check-decision-policy
+python tests/apitest.py --check-agent-event-policy --poll-timeout 40
 ```
 
 Run the separate read-only snapshot benchmark with
@@ -306,17 +341,25 @@ agent experiments. It is not yet a deterministic Gym-style environment.
   main-thread timeout race still needs a runtime stress test.
 - [x] Allow restarting the current map without waiting for game over.
 - [x] Allow an agent to pause for observation and resume at normal speed.
-- [ ] Add lightweight game events and two decision policies: an Agent can poll
-  events and pause when needed; an RL model can pause at a configurable minimum
-  **simulation-time** interval, with critical events allowed to interrupt it.
+- [x] Validate lightweight events and decision policies in a running game.
+  House/destination, upgrade, overcrowding warning/start, and terminal events;
+  the RL simulation-time boundary; configured Agent `houseAdded` critical-event
+  pauses; and one-snapshot-per-boundary reuse have all passed live validation.
 - [x] Validate the expanded action space in a running game: weekly upgrade
   selection, traffic lights, roundabouts, motorways, and an explicit no-op
   have been exercised. Road edits remain individual.
-- [ ] Add episode and execution identity: `episodeId`, `simulationTick`,
-  `actionId`, and a terminal reason.
+- [ ] Finish runtime validation of episode and execution identity. UI restart
+  creates a new `episodeId` while preserving the seed, and road add/clear
+  actions reach `executed` with native command counts and execution times. A
+  real game over reports `overcrowding`, the failed destination, and a matching
+  terminal event. API restart result identity and queued-action expiry across
+  episodes still need live coverage.
 - [ ] Expand observations for high-score play with map bounds and terrain,
   vehicle or road-segment traffic load, motorway endpoints, and legal-action
-  masks.
+  masks. Map bounds, per-tile terrain, road-chunk load, motorway endpoints, and
+  single-candidate legality checks are implemented; bounds, terrain, traffic,
+  and a legal road candidate have passed runtime checks. Broader action-mask
+  cost and systematic visual comparison still need validation.
 
 See the [P0 Agent/RL implementation plan](docs/p0-agent-rl-plan.md) for the
 agreed decision model, development order, and acceptance criteria.
@@ -336,12 +379,14 @@ the action and observation design behind that plan.
 
 ### P2: repository and deployment hygiene
 
-- [ ] Replace machine-specific game paths and live-plugin output defaults in
+- [x] Replace machine-specific game paths and live-plugin output defaults in
   the project file with an explicit `GameDir`/staging configuration.
-- [ ] Remove tracked IDE state, user project settings, old binaries, and
+- [x] Remove tracked IDE state, user project settings, old binaries, and
   vendored package artifacts; restore dependencies during build instead.
 - [ ] Split the monolithic plugin into transport, game-control, snapshot, and
-  contract components, then add CI compile and contract validation.
+  contract components, then add CI compile and contract validation. Static API
+  contract validation now runs in GitHub Actions; source splitting and a CI
+  compile environment with the proprietary game assemblies remain.
 
 ## Current limitations
 

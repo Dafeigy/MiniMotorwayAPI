@@ -7,10 +7,11 @@
 - 基础地址：`http://localhost:9000`，仅监听本机。响应为 UTF-8 JSON，带 `Cache-Control: no-store`。
 - 读取接口使用 `GET`，操作接口使用 `POST`。所有路径接受 `OPTIONS` 预检；CORS 允许任意来源使用 `GET`、`POST` 和 `OPTIONS`，请求头允许 `Content-Type`、`X-Request-Id`。
 - 请求在 Unity 主线程上处理。主线程未在 5 秒内开始处理时，排队请求会过期并返回 `503`；已开始的操作可能先返回 `202` 和 `state`，其最终 HTTP 结果可用 `/requests` 查询。
-- `/actions/road`、`/actions/clear`、`/actions/traffic-light`、`/actions/roundabout`、`/actions/motorway`、`/actions/upgrade`、`/game/new`、`/game/restart` 的请求体限制为 4096（同时检查声明的字节长度和读取后的字符串长度）；JSON 请求使用 `Content-Type: application/json`。`/actions/noop`、`/game/restart`、`/game/pause` 和 `/game/resume` 可发送无请求体的 POST，包括未显式设置 `Content-Length` 的请求。
+- `/actions/road`、`/actions/clear`、`/actions/traffic-light`、`/actions/roundabout`、`/actions/motorway`、`/actions/upgrade`、`/decision/config`、`/game/new`、`/game/restart` 的请求体限制为 4096（同时检查声明的字节长度和读取后的字符串长度）；JSON 请求使用 `Content-Type: application/json`。`/actions/noop`、`/game/restart`、`/game/pause` 和 `/game/resume` 可发送无请求体的 POST，包括未显式设置 `Content-Length` 的请求。
 - 路径区分大小写。未知路径返回 `404`，方法不匹配返回 `405`，未处理的服务器错误返回 `500`。
 - 操作请求的响应头包含 `X-Request-Id`。可传入自定义 ID：1–128 个字符，仅限 ASCII 字母、数字、`-`、`_`、`.`、`:`。同一 ID 搭配完全相同的路径及原始请求体会重放首次结果；搭配不同路径或请求体返回 `409`。省略时由服务端生成 ID。比较的是原始请求体，因此仅改变 JSON 空白也视为不同请求。
-- `202` 表示请求已接受或游戏编辑已排程，**不保证模拟已执行**。编辑后应检查后续 `/snapshot` 的道路、设施、高速公路、资源和 `editCommandsExecuted`；周升级选择应检查后续 `/game/upgrades` 和资源；新游戏或重开应轮询 `/game/status`。
+- 每个操作响应都包含 `requestId`、`actionId` 和提交时的 `episodeId`。`requestId` 跟踪 HTTP／主线程处理，`actionId` 跟踪游戏动作；两者不是同一个标识。
+- `202` 表示请求已接受或游戏编辑已排程，**不保证模拟已执行**。用 `/actions?id=<actionId>` 查询最终状态，并继续用后续 `/snapshot` 校验道路、设施、高速公路和资源等可见效果。周升级选择应检查后续 `/game/upgrades`；新游戏或重开应轮询 `/game/status`。
 
 读取 `/snapshot`、`/tiles`、`/tiles/count`、`/destinations` 和 `/game/status` 的成功响应还带 `X-Snapshot-Capture-Ms` 与 `X-Snapshot-Serialize-Ms`，单位为毫秒，分别是主线程捕获和序列化耗时，不含排队及网络时间。
 
@@ -26,6 +27,10 @@
 | GET | `/game/maps` | 可用于开新局的地图标识与名称 |
 | GET | `/game/upgrades` | 当前待选择的周升级候选项及界面可操作状态 |
 | GET | `/requests?id=<requestId>` | 查询操作请求的处理状态及原始 HTTP 结果 |
+| GET | `/actions?id=<actionId>` | 查询动作的排程与最终执行状态 |
+| GET | `/events?after=<eventId>` | 读取有界、轻量的游戏事件日志 |
+| GET | `/decision/status` | 读取 Agent／RL 决策策略和当前边界 |
+| POST | `/actions/legal` | 预检一项候选动作，不排程模拟命令 |
 | POST | `/actions/road` | 添加一条道路连接 |
 | POST | `/actions/clear` | 按类型清除指定瓦片上的道路或设施 |
 | POST | `/actions/traffic-light` | 在指定瓦片添加交通灯 |
@@ -33,6 +38,7 @@
 | POST | `/actions/motorway` | 用两个端点和方向添加高速公路 |
 | POST | `/actions/upgrade` | 选择当前周升级候选项 |
 | POST | `/actions/noop` | 显式记录无编辑决策，不推进模拟时间 |
+| POST | `/decision/config` | 配置 Agent／RL 自动暂停策略 |
 | POST | `/game/new` | 开始一局普通模式游戏 |
 | POST | `/game/restart` | 重开当前地图 |
 | POST | `/game/pause` | 暂停游戏模拟 |
@@ -42,15 +48,18 @@
 
 ### `GET /snapshot`（`GET /` 为别名）
 
-返回每次请求单独捕获的完整快照。`success` 为 `true`，`timestamp` 为 UTC 时间；`snapshotId` 在每局新游戏开始时重置，此后每次捕获快照时递增。它不是跨多个请求共用的帧编号。主要顶层字段如下：
+返回每次请求单独捕获的完整快照。`success` 为 `true`，`timestamp` 为 UTC 时间；`snapshotId` 在每局新游戏开始时重置，此后每次捕获快照时递增。它不是跨多个请求共用的帧编号。`episodeId` 在原生城市初始化边界生成，在本局内保持不变。`simulationTick` 是原生模拟时钟的帧计数，`simulationTime` 是同一时钟的游戏内时间；暂停期间它们不因 HTTP 请求而推进。主要顶层字段如下：
 
 | 字段 | 含义 |
 | --- | --- |
-| `snapshotId`, `editCommandsExecuted`, `timestamp` | 快照序号、已执行的编辑命令累计数、捕获时间 |
+| `snapshotId`, `episodeId`, `timestamp` | 快照序号、本局 ID、捕获时间 |
+| `simulationTick`, `simulationTime`, `editCommandsExecuted` | 原生模拟帧、模拟时间、已执行的编辑命令累计数 |
+| `terminalReason`, `terminalDestinationBuildingId` | 终局原因及导致终局的目的地；非终局时为 `null`。目前普通失败为 `overcrowding`，无法关联目的地的结束为 `gameEnded` |
 | `phase` | `menu`、`playing` 或 `gameOver` |
 | `gameUI`, `tilemapView`, `camera` | 对应游戏对象是否就绪 |
 | `timeScaleMode` | 游戏时间模式名称；无游戏界面时为 `null` |
 | `initialSeed`, `map` | 本局实际使用的 seed 和地图 `cityName`；尚未就绪时可能为 `null` |
+| `mapBounds` | 地图完整范围 `full` 与随游戏展开的当前范围 `current`，均含 `minX/minY/maxX/maxY` |
 | `score`, `clock`, `resources` | 分数、时钟和可用升级资源；不可用时可能为 `null` |
 | `tileCount`, `tiles`, `vehicleCount`, `vehicles`, `motorwayCount`, `motorways` | 数量和对应数组 |
 
@@ -66,6 +75,8 @@
 | `roads` | 方向名称到道路状态名称的对象；仅包含非 `None` 道路 |
 | `hasTrafficLight`, `isRoundabout` | 是否有交通灯、是否为环岛中心 |
 | `drivewayDirection`, `unbuiltMotorwayId` | 车道入口方向、未建成高速公路 ID |
+| `terrain` | `buildable`、`zoneable`、`driveable`、`water`、`mountain`、`currentlyPlayable` |
+| `traffic` | 有道路块时为 `laneCount`、当前 `vehicleCount`、`stoppedVehicleCount`、`averageSpeed`；无道路块时为 `null` |
 
 房屋的 `buildingId` 为 `H:x:y`；`contentData` 包含 `groupIndex`、`hasWaitingVehicle`，以及 `vehicleCounts`（`owned`、`waiting`、`available`、`realigning`）。目的地的 `buildingId` 为 `D:minX:minY`，多瓦片建筑的所有瓦片共用该 ID；其 `contentData` 包含：
 
@@ -79,13 +90,13 @@
 
 ### `GET /tiles`、`GET /tiles/count`、`GET /destinations`
 
-- `/tiles`：`{ success, snapshotId, count, tiles, timestamp }`；`tiles` 元素与完整快照相同。
-- `/tiles/count`：`{ success, snapshotId, count, timestamp }`。
-- `/destinations`：`{ success, snapshotId, count, destinations, timestamp }`；`destinations` 元素仍是瓦片对象，但每个 `buildingId` 仅出现一次。
+- `/tiles`：`{ success, snapshotId, episodeId, simulationTick, simulationTime, count, tiles, timestamp }`；`tiles` 元素与完整快照相同。
+- `/tiles/count`：`{ success, snapshotId, episodeId, simulationTick, simulationTime, count, timestamp }`。
+- `/destinations`：`{ success, snapshotId, episodeId, simulationTick, simulationTime, count, destinations, timestamp }`；`destinations` 元素仍是瓦片对象，但每个 `buildingId` 仅出现一次。
 
 ### `GET /game/status`
 
-返回 `{ success, snapshotId, editCommandsExecuted, phase, gameUI, tilemapView, camera, timeScaleMode, initialSeed, map, tileCount, score, clock, resources, newGame, timestamp }`。`newGame` 为 `null` 或 `{ map, seed, state, error }`；`state` 可为 `loading`、`starting`、`initializing`、`ready`、`failed`。新局加载超过 30 秒会失败并提供 `error`。
+返回 `{ success, snapshotId, episodeId, simulationTick, simulationTime, terminalReason, terminalDestinationBuildingId, editCommandsExecuted, phase, gameUI, tilemapView, camera, timeScaleMode, initialSeed, map, tileCount, score, clock, resources, newGame, timestamp }`。`newGame` 为 `null` 或 `{ map, seed, state, error }`；`state` 可为 `loading`、`starting`、`initializing`、`ready`、`failed`。新局加载超过 30 秒会失败并提供 `error`。
 
 ### `GET /game/maps`
 
@@ -97,7 +108,42 @@
 
 ### `GET /requests?id=<requestId>`
 
-成功时返回 `{ success, requestId, state, responseStatusCode, response }`。`state` 为 `queued`、`running`、`complete` 或 `expired`；未完成时后两个字段为 `null`，完成后是原始 HTTP 状态码和 JSON 响应。它只能说明请求处理结果，不能证明已排程的模拟编辑已执行。缺少或无效 ID 返回 `400`，未知 ID 返回 `404`。
+成功时返回 `{ success, requestId, actionId, actionState, state, responseStatusCode, response }`。`state` 为 `queued`、`running`、`complete` 或 `expired`；未完成时后两个字段为 `null`，完成后是原始 HTTP 状态码和 JSON 响应。`actionState` 是对应动作的当前状态。缺少或无效 ID 返回 `400`，未知 ID 返回 `404`。
+
+### `GET /actions?id=<actionId>`
+
+返回动作记录：`{ success, actionId, requestId, episodeId, resultingEpisodeId, path, state, resultCode, error, responseStatusCode, queuedAt, scheduledAt, executedAt, scheduledTick, scheduledSimulationTime, executedTick, executedSimulationTime, scheduledCommands, executedCommands, failedCommands }`。`state` 为：
+
+- `queued`：HTTP 请求尚未在游戏主线程开始。
+- `scheduled`：至少一个模拟编辑已排程，或新局／重开正在等待新的城市初始化。
+- `executed`：所有关联的 `EditTileCommand` 已返回，或同步动作的游戏处理函数已接受操作。新局和重开的 `resultingEpisodeId` 指向新局。
+- `rejected`：参数、游戏规则、资源或当前界面拒绝动作。
+- `expired`：动作在主线程开始前超时，或所属局已结束而不再允许执行。
+
+道路、清除、交通灯、环岛和高速公路动作会统计 `scheduledCommands` 与 `executedCommands`；高速公路成功时两者应为 `2`。执行时间来自命令实际执行时的原生模拟时钟。暂停／继续和 no-op 是同步 UI 动作，在处理函数返回时记为执行；其可见状态仍应由后续快照确认。服务端保留最近 4096 条请求及动作记录。缺少或无效 ID 返回 `400`，未知或已淘汰 ID 返回 `404`。
+
+### `GET /events?after=<eventId>`
+
+这是轻量读取路径，不扫描 tile、车辆或构建完整快照，也不返回快照计时响应头。`after` 可省略，默认 `0`。返回 `{ success, episodeId, after, oldestEventId, latestEventId, gap, events }`；顶层 `episodeId` 是当前局，每个事件为 `{ eventId, episodeId, simulationTick, simulationTime, timestamp, reasons, details }`。`eventId` 在插件进程内单调递增，不因重开而归零，因此有界缓冲区可能同时包含旧局事件；客户端应按事件自己的 `episodeId` 区分局。同一局、同一原生模拟 tick 内的多个原因合并在一条记录中。当前原因包括：
+
+- `houseAdded`、`destinationAdded`：房屋或目的地模型完成初始化。
+- `upgradeAvailable`：新增待选周升级。
+- `overcrowdingWarning`：游戏显示即将失败预警。
+- `overcrowdingStarted`：目的地拥挤计时速度由非正数变为正数。
+- `terminal`：游戏进入终局，详情含原因和目的地。
+- `interval`：RL 最小游戏内时间间隔已到达。
+
+日志保留最近 1024 个模拟边界。若 `after` 早于仍保留的第一条记录之前，`gap` 为 `true`，客户端应重新读取完整快照并从 `latestEventId` 继续。事件钩子的精确提前量仍需按游戏版本做运行验证。
+
+### `GET /decision/status`
+
+轻量返回 `{ success, episodeId, mode, minimumSimulationInterval, autoPauseReasons, pending, eventId, simulationTick, simulationTime, reasons, snapshotId }`。`mode` 为 `off`、`agent` 或 `rl`。当决策边界触发时，游戏在本次模拟更新结束后暂停，`pending` 为 `true`；同一边界重复读取 `/snapshot` 会复用 `snapshotId`、模拟 tick 和不可变 DTO，直到动作使缓存失效或游戏恢复。
+
+### `POST /actions/legal`
+
+只读预检一项候选动作，不创建 `requestId`／`actionId`，不排程模拟命令，也不消耗资源。返回 `{ success, type, legal, resultCode, errorPosition }`，候选不合法仍返回 HTTP `200` 并以 `legal: false` 表示；请求格式错误返回 `400`，无活动游戏服务返回 `409`。
+
+请求的 `type` 可为 `road`、`clear`、`traffic-light`、`roundabout`、`motorway`、`upgrade` 或 `noop`。其余字段与对应执行接口相同；`clear` 在此使用 `clearType`，以免与动作类型字段冲突。预检复用游戏原生 `TileEditor` 规则并立即释放生成的临时 edit，因此执行时仍须再次接受资源和地图状态校验；它不是对未来状态的预留。
 
 ## 操作接口
 
@@ -129,6 +175,16 @@
 
 无需请求体。有活动游戏或升级界面时返回 `200`：`{ "success": true, "scheduled": false, "resultCode": "NoOp" }`；否则返回 `409`。它不编辑地图、不选择升级、不暂停或恢复游戏，也不主动推进模拟时间。决策控制器可在记录无动作决策后调用 `/game/resume`；原生模拟仍可能在 HTTP 请求之间自行推进。
 
+### `POST /decision/config`
+
+请求体可包含 `{ "mode":"rl", "minimumSimulationInterval":30.0, "autoPauseReasons":["upgradeAvailable","overcrowdingWarning","terminal"] }`；省略的字段保留当前值。`minimumSimulationInterval` 必须为正数，单位是游戏原生模拟时间而非现实秒。`autoPauseReasons` 仅接受当前事件原因（不含由 RL 间隔自身产生的 `interval`）。
+
+- `off`：不自动建立决策边界；事件日志仍继续记录。
+- `agent`：Agent 轮询 `/events`；只有列入 `autoPauseReasons` 的事件自动暂停。
+- `rl`：达到最小模拟时间间隔时自动暂停；列入 `autoPauseReasons` 的关键事件可提前打断间隔。
+
+间隔从本局开始或最近一个 `/actions/*` 动作实际执行的模拟时间计算。边界暂停后，提交具体动作或 `/actions/noop`，再调用 `/game/resume`。如果没有提交动作就恢复，已到期的 RL 间隔会再次立即建立边界。`/game/resume` 清除当前 `pending`，但不会伪造决策动作。配置本身也有 `requestId` 和 `actionId`。
+
 ### `POST /game/new`
 
 请求体示例：`{"map":"LosAngeles","seed":12345,"startPaused":true}`。`map` 必填，值来自 `/game/maps`；`seed` 可选，为 `0` 至 `4294967295` 的整数，省略时使用 `20261014`；`startPaused` 可选，默认 `false`。仅开始普通模式游戏，会丢弃当前一局。可从主菜单、地图选择界面或活动游戏界面调用；游戏结束界面需先退出。
@@ -151,6 +207,9 @@ Invoke-RestMethod http://localhost:9000/game/status
 $body = @{ x = 5; y = 7; direction = 'East' } | ConvertTo-Json
 Invoke-RestMethod http://localhost:9000/actions/road -Method Post -ContentType 'application/json' -Headers @{ 'X-Request-Id' = 'road-5-7-east-1' } -Body $body
 Invoke-RestMethod 'http://localhost:9000/requests?id=road-5-7-east-1'
+$actionId = (Invoke-RestMethod 'http://localhost:9000/requests?id=road-5-7-east-1').actionId
+Invoke-RestMethod "http://localhost:9000/actions?id=$actionId"
+Invoke-RestMethod 'http://localhost:9000/events?after=0'
 ```
 
 默认只读的运行验证命令为 `python tests/apitest.py`；道路、暂停和重开等会改变游戏状态的验证需显式传入对应选项。快照字段的后续规划见 [snapshot-roadmap.md](snapshot-roadmap.md)。

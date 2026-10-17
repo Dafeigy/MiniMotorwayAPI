@@ -38,6 +38,8 @@ namespace Moretoways
         private const int Port = 9000;
         private const int RequestTimeoutMs = 5000;
         private const int MaxRequestIdLength = 128;
+        private const int MaxActionRecords = 4096;
+        private const int MaxEventRecords = 1024;
         // Fresh normal games retain the historical default seed.
         private const uint FixedSimulationSeed = 20261014u;
         private const float NewGameLoadTimeoutSeconds = 30f;
@@ -46,6 +48,21 @@ namespace Moretoways
         private readonly Dictionary<string, SnapshotRequest> actionRequests =
             new Dictionary<string, SnapshotRequest>(StringComparer.Ordinal);
         private readonly object actionRequestsLock = new object();
+        private readonly Dictionary<string, ActionRecord> actionRecords =
+            new Dictionary<string, ActionRecord>(StringComparer.Ordinal);
+        private readonly Queue<string> actionRecordOrder = new Queue<string>();
+        private readonly Dictionary<EditTileCommand, string> pendingEditActions =
+            new Dictionary<EditTileCommand, string>();
+        private readonly object actionRecordsLock = new object();
+        private readonly List<GameEventRecord> eventRecords = new List<GameEventRecord>();
+        private readonly object eventRecordsLock = new object();
+        private readonly HashSet<string> activeOvercrowdingDestinations =
+            new HashSet<string>(StringComparer.Ordinal);
+        private readonly HashSet<string> warnedOvercrowdingDestinations =
+            new HashSet<string>(StringComparer.Ordinal);
+        private readonly HashSet<string> autoPauseReasons =
+            new HashSet<string>(StringComparer.Ordinal);
+        private readonly object decisionLock = new object();
         private HttpListener httpListener;
         private Thread httpThread;
         private volatile bool isRunning;
@@ -55,6 +72,28 @@ namespace Moretoways
         private int lastScore;
         private ulong? initialSimulationSeed;
         private ulong? nextGameSeed;
+        private string episodeId;
+        private string terminalReason;
+        private string terminalDestinationBuildingId;
+        private string activeActionId;
+        private long nextEventId;
+        private string decisionMode = "off";
+        private double minimumSimulationInterval = 60d;
+        private double lastDecisionActionSimulationTime;
+        private bool decisionPending;
+        private bool decisionCapturePending;
+        private long? decisionEventId;
+        private int? decisionTick;
+        private double? decisionSimulationTime;
+        private List<string> decisionReasons = new List<string>();
+        private long? stagedDecisionEventId;
+        private int? stagedDecisionTick;
+        private double? stagedDecisionSimulationTime;
+        private List<string> stagedDecisionReasons = new List<string>();
+        private readonly HashSet<string> pendingCriticalReasons =
+            new HashSet<string>(StringComparer.Ordinal);
+        private long? pendingCriticalEventId;
+        private GameSnapshot decisionSnapshot;
         private NewGameLaunch newGameLaunch;
         private bool alwaysShowWorldGrid;
         private GameUIScreen gridGameUI;
@@ -68,17 +107,22 @@ namespace Moretoways
             public readonly string Path;
             public readonly string Body;
             public readonly string RequestId;
+            public readonly string ActionId;
+            public readonly string EpisodeId;
             private readonly long deadlineTimestamp;
             // 0 = queued, 1 = running, 2 = complete, 3 = expired.
             private int state;
             public readonly TaskCompletionSource<ApiResponse> Completion =
                 new TaskCompletionSource<ApiResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
 
-            public SnapshotRequest(string path, string body, string requestId)
+            public SnapshotRequest(string path, string body, string requestId,
+                string actionId = null, string episodeId = null)
             {
                 Path = path;
                 Body = body;
                 RequestId = requestId;
+                ActionId = actionId;
+                EpisodeId = episodeId;
                 deadlineTimestamp = Stopwatch.GetTimestamp() +
                     Stopwatch.Frequency * RequestTimeoutMs / 1000;
             }
@@ -136,10 +180,74 @@ namespace Moretoways
                 {
                     success = false,
                     requestId = RequestId,
+                    actionId = ActionId,
+                    episodeId = EpisodeId,
                     state = "expired",
                     error = "Game main thread did not start this request before its deadline"
                 }));
             }
+        }
+
+        private sealed class ActionRecord
+        {
+            public bool success = true;
+            public string actionId;
+            public string requestId;
+            public string episodeId;
+            public string resultingEpisodeId;
+            public string path;
+            public string state;
+            public string resultCode;
+            public string error;
+            public int? responseStatusCode;
+            public DateTime queuedAt;
+            public DateTime? scheduledAt;
+            public DateTime? executedAt;
+            public int? scheduledTick;
+            public double? scheduledSimulationTime;
+            public int? executedTick;
+            public double? executedSimulationTime;
+            public int scheduledCommands;
+            public int executedCommands;
+            public int failedCommands;
+            [JsonIgnore]
+            public bool submissionComplete;
+            [JsonIgnore]
+            public bool awaitingEpisodeStart;
+        }
+
+        private sealed class GameEventRecord
+        {
+            public long eventId;
+            public string episodeId;
+            public int? simulationTick;
+            public double? simulationTime;
+            public DateTime timestamp;
+            public List<string> reasons = new List<string>();
+            public List<object> details = new List<object>();
+        }
+
+        private sealed class DecisionConfigRequest
+        {
+            public string mode { get; set; }
+            public double? minimumSimulationInterval { get; set; }
+            public List<string> autoPauseReasons { get; set; }
+        }
+
+        private sealed class LegalActionRequest
+        {
+            public string type { get; set; }
+            public int? x { get; set; }
+            public int? y { get; set; }
+            public string direction { get; set; }
+            public string clearType { get; set; }
+            public int? startX { get; set; }
+            public int? startY { get; set; }
+            public string startDirection { get; set; }
+            public int? endX { get; set; }
+            public int? endY { get; set; }
+            public string endDirection { get; set; }
+            public int? optionIndex { get; set; }
         }
 
         private sealed class RoadRequest
@@ -224,12 +332,19 @@ namespace Moretoways
             public bool isRoundabout;
             public string drivewayDirection;
             public int unbuiltMotorwayId;
+            public object terrain;
+            public object traffic;
         }
 
         private sealed class GameSnapshot
         {
             public bool success = true;
             public long snapshotId;
+            public string episodeId;
+            public int? simulationTick;
+            public double? simulationTime;
+            public string terminalReason;
+            public string terminalDestinationBuildingId;
             public int editCommandsExecuted;
             public DateTime timestamp;
             public string phase;
@@ -239,6 +354,7 @@ namespace Moretoways
             public string timeScaleMode;
             public ulong? initialSeed;
             public string map;
+            public object mapBounds;
             public int? score;
             public object clock;
             public object resources;
@@ -338,13 +454,15 @@ namespace Moretoways
                     return;
                 }
 
+                bool isQueryPost = path == "/actions/legal";
                 bool isAction = path == "/actions/road" || path == "/actions/clear" ||
                     path == "/actions/traffic-light" || path == "/actions/roundabout" ||
                     path == "/actions/motorway" || path == "/actions/upgrade" ||
                     path == "/actions/noop" ||
+                    path == "/decision/config" ||
                     path == "/game/new" || path == "/game/restart" || path == "/game/pause" ||
                     path == "/game/resume";
-                if (method != (isAction ? "POST" : "GET"))
+                if (method != (isAction || isQueryPost ? "POST" : "GET"))
                 {
                     SendJson(response, 405, "{\"error\":\"Method Not Allowed\"}");
                     return;
@@ -353,7 +471,9 @@ namespace Moretoways
                 if (path != "/" && path != "/snapshot" && path != "/requests" && path != "/tiles" &&
                     path != "/tiles/count" && path != "/destinations" &&
                     path != "/game/status" && path != "/game/maps" &&
-                    path != "/game/upgrades" && !isAction)
+                    path != "/game/upgrades" && path != "/actions" &&
+                    path != "/events" && path != "/decision/status" &&
+                    !isAction && !isQueryPost)
                 {
                     SendJson(response, 404, "{\"error\":\"Not Found\"}");
                     return;
@@ -362,6 +482,21 @@ namespace Moretoways
                 if (path == "/requests")
                 {
                     SendRequestStatus(context.Request, response);
+                    return;
+                }
+                if (path == "/actions")
+                {
+                    SendActionStatus(context.Request, response);
+                    return;
+                }
+                if (path == "/events")
+                {
+                    SendEvents(context.Request, response);
+                    return;
+                }
+                if (path == "/decision/status")
+                {
+                    SendDecisionStatus(response);
                     return;
                 }
 
@@ -384,7 +519,8 @@ namespace Moretoways
                 if (path == "/actions/road" || path == "/actions/clear" ||
                     path == "/actions/traffic-light" || path == "/actions/roundabout" ||
                     path == "/actions/motorway" || path == "/actions/upgrade" ||
-                    path == "/game/new" || path == "/game/restart")
+                    path == "/decision/config" ||
+                    path == "/game/new" || path == "/game/restart" || isQueryPost)
                 {
                     if (context.Request.ContentLength64 > 4096)
                     {
@@ -415,8 +551,11 @@ namespace Moretoways
                         }
                         else
                         {
-                            request = new SnapshotRequest(path, body, requestId);
+                            string actionId = Guid.NewGuid().ToString("N");
+                            request = new SnapshotRequest(path, body, requestId,
+                                actionId, episodeId);
                             actionRequests.Add(requestId, request);
+                            RegisterAction(request);
                         }
                     }
                     if (requestIdConflict)
@@ -440,6 +579,8 @@ namespace Moretoways
                     // instead of reporting that the action was not executed.
                     if (request.TryExpire() || request.Completion.Task.IsCompleted)
                     {
+                        ExpireAction(request.ActionId,
+                            "Game main thread did not start this action before its deadline");
                         ApiResponse timedResult = request.Completion.Task.Result;
                         SendApiResponse(response, timedResult);
                         return;
@@ -450,6 +591,7 @@ namespace Moretoways
                         {
                             success = true,
                             requestId = requestId,
+                            actionId = request.ActionId,
                             state = request.State
                         })
                         : "{\"error\":\"Game main thread did not respond\"}");
@@ -541,10 +683,116 @@ namespace Moretoways
             {
                 success = true,
                 requestId = requestId,
+                actionId = request.ActionId,
+                actionState = GetActionState(request.ActionId),
                 state = request.State,
                 responseStatusCode = result == null ? (int?)null : result.StatusCode,
                 response = result == null ? null : JsonConvert.DeserializeObject(result.Json)
             }));
+        }
+
+        private void SendActionStatus(HttpListenerRequest httpRequest,
+            HttpListenerResponse response)
+        {
+            string actionId = httpRequest.QueryString["id"];
+            if (string.IsNullOrEmpty(actionId) || !IsValidRequestId(actionId))
+            {
+                SendJson(response, 400,
+                    "{\"success\":false,\"error\":\"Expected a valid id query parameter\"}");
+                return;
+            }
+
+            string json;
+            lock (actionRecordsLock)
+            {
+                ActionRecord record;
+                if (!actionRecords.TryGetValue(actionId, out record))
+                {
+                    SendJson(response, 404,
+                        "{\"success\":false,\"error\":\"Unknown action ID\"}");
+                    return;
+                }
+                json = JsonConvert.SerializeObject(record);
+            }
+            SendJson(response, 200, json);
+        }
+
+        private string GetActionState(string actionId)
+        {
+            if (actionId == null)
+                return null;
+            lock (actionRecordsLock)
+            {
+                ActionRecord record;
+                return actionRecords.TryGetValue(actionId, out record) ? record.state : null;
+            }
+        }
+
+        private void SendEvents(HttpListenerRequest request, HttpListenerResponse response)
+        {
+            long after = 0;
+            string rawAfter = request.QueryString["after"];
+            if (!string.IsNullOrEmpty(rawAfter) &&
+                (!long.TryParse(rawAfter, NumberStyles.None, CultureInfo.InvariantCulture, out after) ||
+                 after < 0))
+            {
+                SendJson(response, 400,
+                    "{\"success\":false,\"error\":\"after must be a nonnegative integer\"}");
+                return;
+            }
+
+            string json;
+            lock (eventRecordsLock)
+            {
+                long oldestEventId = eventRecords.Count == 0 ? nextEventId + 1 :
+                    eventRecords[0].eventId;
+                var events = new List<GameEventRecord>();
+                foreach (GameEventRecord gameEvent in eventRecords)
+                {
+                    if (gameEvent.eventId > after)
+                        events.Add(gameEvent);
+                }
+                json = JsonConvert.SerializeObject(new
+                {
+                    success = true,
+                    episodeId = episodeId,
+                    after = after,
+                    oldestEventId = oldestEventId,
+                    latestEventId = nextEventId,
+                    gap = eventRecords.Count > 0 && after < oldestEventId - 1,
+                    events = events
+                });
+            }
+            SendJson(response, 200, json);
+        }
+
+        private void SendDecisionStatus(HttpListenerResponse response)
+        {
+            string json;
+            lock (decisionLock)
+                json = SerializeDecisionStatus();
+            SendJson(response, 200, json);
+        }
+
+        private string SerializeDecisionStatus()
+        {
+            var reasons = new List<string>(decisionReasons);
+            var pauseReasons = new List<string>(autoPauseReasons);
+            pauseReasons.Sort(StringComparer.Ordinal);
+            return JsonConvert.SerializeObject(new
+            {
+                success = true,
+                episodeId = episodeId,
+                mode = decisionMode,
+                minimumSimulationInterval = minimumSimulationInterval,
+                autoPauseReasons = pauseReasons,
+                pending = decisionPending,
+                eventId = decisionEventId,
+                simulationTick = decisionTick,
+                simulationTime = decisionSimulationTime,
+                reasons = reasons,
+                snapshotId = decisionSnapshot == null ? (long?)null : decisionSnapshot.snapshotId
+            });
         }
 
         private static bool TrySendJson(HttpListenerResponse response, int statusCode, string json)
@@ -598,6 +846,203 @@ namespace Moretoways
             response.Close(bytes, true);
         }
 
+        private void RegisterAction(SnapshotRequest request)
+        {
+            var record = new ActionRecord
+            {
+                actionId = request.ActionId,
+                requestId = request.RequestId,
+                episodeId = request.EpisodeId,
+                path = request.Path,
+                state = "queued",
+                queuedAt = DateTime.UtcNow
+            };
+            lock (actionRecordsLock)
+            {
+                actionRecords.Add(record.actionId, record);
+                actionRecordOrder.Enqueue(record.actionId);
+                while (actionRecordOrder.Count > MaxActionRecords)
+                {
+                    string expiredId = actionRecordOrder.Dequeue();
+                    ActionRecord expiredRecord;
+                    if (actionRecords.TryGetValue(expiredId, out expiredRecord))
+                    {
+                        actionRecords.Remove(expiredId);
+                        actionRequests.Remove(expiredRecord.requestId);
+                    }
+                }
+            }
+        }
+
+        private void ExpireAction(string actionId, string error)
+        {
+            if (actionId == null)
+                return;
+            lock (actionRecordsLock)
+            {
+                ActionRecord record;
+                if (!actionRecords.TryGetValue(actionId, out record) ||
+                    record.state == "executed" || record.state == "rejected" ||
+                    record.state == "expired")
+                    return;
+                record.state = "expired";
+                record.resultCode = "Expired";
+                record.error = error;
+            }
+        }
+
+        private bool RejectActionFromPreviousEpisode(SnapshotRequest request)
+        {
+            if (request.ActionId == null || request.Path == "/game/new" ||
+                request.Path == "/game/restart" || request.EpisodeId == episodeId)
+                return false;
+
+            ExpireAction(request.ActionId,
+                "Action belongs to a previous episode and was not executed");
+            request.Complete(AttachActionMetadata(request, new ApiResponse(409,
+                "{\"success\":false,\"resultCode\":\"EpisodeChanged\"," +
+                "\"error\":\"Action belongs to a previous episode\"}")));
+            return true;
+        }
+
+        private ApiResponse CompleteAction(SnapshotRequest request, ApiResponse response)
+        {
+            if (request.ActionId == null)
+                return response;
+
+            JObject payload = null;
+            try { payload = JObject.Parse(response.Json); }
+            catch (JsonException) { }
+
+            string resultCode = payload == null ? null : (string)payload["resultCode"];
+            string error = payload == null ? null : (string)payload["error"];
+            int? tick;
+            double? simulationTime;
+            GetCurrentSimulationPosition(out tick, out simulationTime);
+
+            lock (actionRecordsLock)
+            {
+                ActionRecord record;
+                if (actionRecords.TryGetValue(request.ActionId, out record))
+                {
+                    record.responseStatusCode = response.StatusCode;
+                    record.resultCode = resultCode ??
+                        (response.StatusCode >= 400 ? "Rejected" : "Executed");
+                    record.error = error;
+                    record.submissionComplete = true;
+                    record.awaitingEpisodeStart = response.StatusCode == 202 &&
+                        (request.Path == "/game/new" || request.Path == "/game/restart");
+
+                    if (record.scheduledCommands > 0 || record.awaitingEpisodeStart)
+                    {
+                        record.state = "scheduled";
+                        record.scheduledAt = DateTime.UtcNow;
+                        record.scheduledTick = tick;
+                        record.scheduledSimulationTime = simulationTime;
+                    }
+                    else if (response.StatusCode >= 400)
+                    {
+                        record.state = "rejected";
+                    }
+                    else
+                    {
+                        record.state = "executed";
+                        record.executedAt = DateTime.UtcNow;
+                        record.executedTick = tick;
+                        record.executedSimulationTime = simulationTime;
+                    }
+
+                    if (record.scheduledCommands > 0 &&
+                        record.executedCommands >= record.scheduledCommands)
+                        MarkActionExecuted(record, tick, simulationTime);
+                }
+            }
+            return AttachActionMetadata(request, response);
+        }
+
+        private ApiResponse AttachActionMetadata(SnapshotRequest request, ApiResponse response)
+        {
+            if (request.ActionId == null)
+                return response;
+            try
+            {
+                JObject payload = JObject.Parse(response.Json);
+                payload["requestId"] = request.RequestId;
+                payload["actionId"] = request.ActionId;
+                payload["episodeId"] = request.EpisodeId == null ?
+                    JValue.CreateNull() : new JValue(request.EpisodeId);
+                return new ApiResponse(response.StatusCode,
+                    JsonConvert.SerializeObject(payload), response.SnapshotCaptureMs,
+                    response.SnapshotSerializeMs);
+            }
+            catch (JsonException)
+            {
+                return response;
+            }
+        }
+
+        private void MarkActionExecuted(ActionRecord record, int? tick,
+            double? simulationTime)
+        {
+            record.state = "executed";
+            record.executedAt = DateTime.UtcNow;
+            record.executedTick = tick;
+            record.executedSimulationTime = simulationTime;
+            if (simulationTime.HasValue && record.path != null &&
+                record.path.StartsWith("/actions/", StringComparison.Ordinal))
+            {
+                lock (decisionLock)
+                    lastDecisionActionSimulationTime = simulationTime.Value;
+            }
+            InvalidateDecisionSnapshot();
+        }
+
+        private void InvalidateDecisionSnapshot()
+        {
+            lock (decisionLock)
+                decisionSnapshot = null;
+        }
+
+        private GameSnapshot CaptureOrReuseSnapshot()
+        {
+            lock (decisionLock)
+            {
+                if (decisionPending && decisionSnapshot != null)
+                    return decisionSnapshot;
+            }
+            GameSnapshot snapshot = CaptureSnapshot();
+            lock (decisionLock)
+            {
+                if (decisionPending && decisionSnapshot == null)
+                    decisionSnapshot = snapshot;
+            }
+            return snapshot;
+        }
+
+        private void GetCurrentSimulationPosition(out int? tick, out double? simulationTime)
+        {
+            tick = null;
+            simulationTime = null;
+            var gameUI = UnityEngine.Object.FindObjectOfType<GameUIScreen>();
+            var simulation = gameUI == null ? null :
+                Traverse.Create(gameUI).Field("_simulation").GetValue<Server.ISimulation>();
+            CaptureSimulationPosition(simulation, out tick, out simulationTime);
+        }
+
+        private static void CaptureSimulationPosition(Server.ISimulation simulation,
+            out int? tick, out double? simulationTime)
+        {
+            tick = null;
+            simulationTime = null;
+            if (simulation == null)
+                return;
+            ClockModel clock = simulation.GetModel<ClockModel>();
+            if (clock == null || clock.Clock == null)
+                return;
+            tick = clock.Clock.FrameCount;
+            simulationTime = (double)clock.Clock.Time;
+        }
+
         private void Update()
         {
             if (Input.GetKeyDown(KeyCode.M) &&
@@ -607,64 +1052,85 @@ namespace Moretoways
             }
 
             AdvanceNewGameLaunch();
+            AdvancePendingDecisionBoundary();
 
             SnapshotRequest request;
             // A paused game can leave several requests in the queue past their
             // deadlines. Skip all expired entries in the same frame so they do
             // not delay the next live request by one frame each.
-            do
+            while (true)
             {
                 if (!requests.TryDequeue(out request))
                     return;
-            } while (!request.TryBegin());
+                if (request.TryBegin())
+                    break;
+                ExpireAction(request.ActionId,
+                    "Game main thread did not start this action before its deadline");
+            }
 
+            if (RejectActionFromPreviousEpisode(request))
+                return;
+
+            activeActionId = request.ActionId;
+            if (request.ActionId != null && request.Path != "/decision/config")
+                InvalidateDecisionSnapshot();
             try
             {
                 // Game objects are copied on Unity's main thread. The HTTP thread
                 // receives JSON only and never accesses a live game object.
+                ApiResponse result;
                 if (request.Path == "/actions/road")
-                    request.Complete(AddRoad(request.Body));
+                    result = AddRoad(request.Body);
                 else if (request.Path == "/actions/clear")
-                    request.Complete(ClearRoads(request.Body));
+                    result = ClearRoads(request.Body);
                 else if (request.Path == "/actions/traffic-light")
-                    request.Complete(AddTrafficLight(request.Body));
+                    result = AddTrafficLight(request.Body);
                 else if (request.Path == "/actions/roundabout")
-                    request.Complete(AddRoundabout(request.Body));
+                    result = AddRoundabout(request.Body);
                 else if (request.Path == "/actions/motorway")
-                    request.Complete(AddMotorway(request.Body));
+                    result = AddMotorway(request.Body);
                 else if (request.Path == "/actions/upgrade")
-                    request.Complete(SelectUpgrade(request.Body));
+                    result = SelectUpgrade(request.Body);
                 else if (request.Path == "/actions/noop")
-                    request.Complete(NoOp());
+                    result = NoOp();
+                else if (request.Path == "/actions/legal")
+                    result = CheckLegalAction(request.Body);
+                else if (request.Path == "/decision/config")
+                    result = ConfigureDecisionPolicy(request.Body);
                 else if (request.Path == "/game/restart")
-                    request.Complete(RestartGame(request.Body));
+                    result = RestartGame(request.Body);
                 else if (request.Path == "/game/new")
-                    request.Complete(StartNewGame(request.Body));
+                    result = StartNewGame(request.Body);
                 else if (request.Path == "/game/pause")
-                    request.Complete(SetGamePaused(true));
+                    result = SetGamePaused(true);
                 else if (request.Path == "/game/resume")
-                    request.Complete(SetGamePaused(false));
+                    result = SetGamePaused(false);
                 else if (request.Path == "/game/maps")
-                    request.Complete(GetGameMaps());
+                    result = GetGameMaps();
                 else if (request.Path == "/game/upgrades")
-                    request.Complete(GetUpgradeChoices());
+                    result = GetUpgradeChoices();
                 else
                 {
                     long captureStarted = Stopwatch.GetTimestamp();
-                    GameSnapshot snapshot = CaptureSnapshot();
+                    GameSnapshot snapshot = CaptureOrReuseSnapshot();
                     long serializeStarted = Stopwatch.GetTimestamp();
                     string json = SerializeResponse(snapshot, request.Path);
                     long finished = Stopwatch.GetTimestamp();
-                    request.Complete(new ApiResponse(200, json,
+                    result = new ApiResponse(200, json,
                         (serializeStarted - captureStarted) * 1000.0 / Stopwatch.Frequency,
-                        (finished - serializeStarted) * 1000.0 / Stopwatch.Frequency));
+                        (finished - serializeStarted) * 1000.0 / Stopwatch.Frequency);
                 }
+                request.Complete(CompleteAction(request, result));
             }
             catch (Exception exception)
             {
                 Logger.LogError("Snapshot failed: " + exception);
-                request.Complete(new ApiResponse(500,
-                    "{\"success\":false,\"error\":\"Snapshot failed\"}"));
+                request.Complete(CompleteAction(request, new ApiResponse(500,
+                    "{\"success\":false,\"error\":\"Request failed\"}")));
+            }
+            finally
+            {
+                activeActionId = null;
             }
         }
 
@@ -914,6 +1380,376 @@ namespace Moretoways
                 "{\"success\":true,\"scheduled\":false,\"resultCode\":\"NoOp\"}");
         }
 
+        private ApiResponse ConfigureDecisionPolicy(string body)
+        {
+            DecisionConfigRequest input;
+            try
+            {
+                JObject payload = JObject.Parse(body);
+                JToken value;
+                if (payload.TryGetValue("mode", out value) && value.Type != JTokenType.String ||
+                    payload.TryGetValue("minimumSimulationInterval", out value) &&
+                    value.Type != JTokenType.Integer && value.Type != JTokenType.Float ||
+                    payload.TryGetValue("autoPauseReasons", out value) &&
+                    value.Type != JTokenType.Array)
+                    return new ApiResponse(400,
+                        "{\"success\":false,\"error\":\"Invalid decision configuration types\"}");
+                input = payload.ToObject<DecisionConfigRequest>();
+            }
+            catch (JsonException)
+            {
+                return new ApiResponse(400, "{\"success\":false,\"error\":\"Invalid JSON\"}");
+            }
+            if (input == null)
+                return new ApiResponse(400,
+                    "{\"success\":false,\"error\":\"Expected decision configuration\"}");
+            if (input.mode != null && input.mode != "off" && input.mode != "agent" &&
+                input.mode != "rl")
+                return new ApiResponse(400,
+                    "{\"success\":false,\"error\":\"mode must be off, agent or rl\"}");
+            if (input.minimumSimulationInterval.HasValue &&
+                (double.IsNaN(input.minimumSimulationInterval.Value) ||
+                 double.IsInfinity(input.minimumSimulationInterval.Value) ||
+                 input.minimumSimulationInterval.Value <= 0d))
+                return new ApiResponse(400,
+                    "{\"success\":false,\"error\":\"minimumSimulationInterval must be positive\"}");
+            if (input.autoPauseReasons != null)
+            {
+                foreach (string reason in input.autoPauseReasons)
+                {
+                    if (!IsKnownEventReason(reason))
+                        return new ApiResponse(400, JsonConvert.SerializeObject(new
+                        {
+                            success = false,
+                            error = "Unknown auto-pause reason",
+                            reason = reason
+                        }));
+                }
+            }
+
+            string json;
+            lock (decisionLock)
+            {
+                if (input.mode != null)
+                    decisionMode = input.mode;
+                if (input.minimumSimulationInterval.HasValue)
+                    minimumSimulationInterval = input.minimumSimulationInterval.Value;
+                if (input.autoPauseReasons != null)
+                {
+                    autoPauseReasons.Clear();
+                    foreach (string reason in input.autoPauseReasons)
+                        autoPauseReasons.Add(reason);
+                }
+                if (decisionMode == "off")
+                {
+                    decisionPending = false;
+                    decisionCapturePending = false;
+                    decisionEventId = null;
+                    decisionTick = null;
+                    decisionSimulationTime = null;
+                    stagedDecisionEventId = null;
+                    stagedDecisionTick = null;
+                    stagedDecisionSimulationTime = null;
+                    stagedDecisionReasons.Clear();
+                    decisionReasons.Clear();
+                    pendingCriticalReasons.Clear();
+                    pendingCriticalEventId = null;
+                    decisionSnapshot = null;
+                }
+                json = SerializeDecisionStatus();
+            }
+            return new ApiResponse(200, json);
+        }
+
+        private ApiResponse CheckLegalAction(string body)
+        {
+            LegalActionRequest input;
+            try { input = JsonConvert.DeserializeObject<LegalActionRequest>(body); }
+            catch (JsonException)
+            {
+                return new ApiResponse(400, "{\"success\":false,\"error\":\"Invalid JSON\"}");
+            }
+            if (input == null || string.IsNullOrEmpty(input.type))
+                return new ApiResponse(400,
+                    "{\"success\":false,\"error\":\"Expected action type\"}");
+
+            string type = input.type.ToLowerInvariant();
+            if (type == "noop")
+            {
+                bool active = UnityEngine.Object.FindObjectOfType<GameUIScreen>() != null ||
+                    UnityEngine.Object.FindObjectOfType<GameUpgradeScreen>() != null;
+                return LegalActionResponse(type, active,
+                    active ? "NoOp" : "NoActiveGame", null);
+            }
+            if (type == "upgrade")
+            {
+                if (!input.optionIndex.HasValue || input.optionIndex.Value < 0)
+                    return new ApiResponse(400,
+                        "{\"success\":false,\"error\":\"Expected nonnegative optionIndex\"}");
+                GameUpgradeScreen screen;
+                UpgradeDatabaseModel database;
+                int[] mapping;
+                bool available = TryGetUpgradeState(out screen, out database, out mapping) &&
+                    database.pendingUpgradeChoices.Count > 0 &&
+                    UpgradeScreenIsReady(screen, mapping);
+                bool legal = available &&
+                    input.optionIndex.Value < database.pendingUpgradeChoices[0].choices.Count &&
+                    Array.IndexOf(mapping, input.optionIndex.Value) >= 0;
+                return LegalActionResponse(type, legal,
+                    legal ? "Legal" : available ? "UnavailableOption" : "UpgradeNotReady", null);
+            }
+
+            var gameUI = UnityEngine.Object.FindObjectOfType<GameUIScreen>();
+            var tilemapView = gameUI == null ? null :
+                Traverse.Create(gameUI).Field("_tilemapView").GetValue<TilemapView>();
+            var scope = tilemapView == null ? null :
+                Traverse.Create(tilemapView).Field("_scope").GetValue<Factory.IScope>();
+            TileEditor editor = scope == null ? null : scope.Get<TileEditor>();
+            if (gameUI == null || tilemapView == null || scope == null || editor == null)
+                return new ApiResponse(409,
+                    "{\"success\":false,\"error\":\"No active game action services\"}");
+
+            TileEditResult result;
+            if (type == "road")
+            {
+                TileDirection direction;
+                if (!input.x.HasValue || !input.y.HasValue ||
+                    !TryParseDirection(input.direction, out direction))
+                    return new ApiResponse(400,
+                        "{\"success\":false,\"error\":\"Expected x, y and direction\"}");
+                result = editor.AddRoad(tilemapView,
+                    new Vector2Int(input.x.Value, input.y.Value), direction);
+            }
+            else if (type == "clear")
+            {
+                if (!input.x.HasValue || !input.y.HasValue)
+                    return new ApiResponse(400,
+                        "{\"success\":false,\"error\":\"Expected x and y\"}");
+                TileEditor.ClearTileOfType clearType = TileEditor.ClearTileOfType.Roads;
+                if (input.clearType != null &&
+                    (!Enum.TryParse(input.clearType, true, out clearType) ||
+                     !Enum.IsDefined(typeof(TileEditor.ClearTileOfType), clearType)))
+                    return new ApiResponse(400,
+                        "{\"success\":false,\"error\":\"Invalid clearType\"}");
+                result = editor.ClearTileExplicit(tilemapView,
+                    new Vector2Int(input.x.Value, input.y.Value), clearType,
+                    Tile.TileChangePermissions.RespectPermanence);
+            }
+            else if (type == "traffic-light" || type == "roundabout")
+            {
+                if (!input.x.HasValue || !input.y.HasValue)
+                    return new ApiResponse(400,
+                        "{\"success\":false,\"error\":\"Expected x and y\"}");
+                Vector2Int coordinates = new Vector2Int(input.x.Value, input.y.Value);
+                result = type == "traffic-light" ?
+                    editor.AddTrafficLight(tilemapView, coordinates) :
+                    editor.AddRoundabout(tilemapView, coordinates);
+            }
+            else if (type == "motorway")
+            {
+                TileDirection startDirection;
+                TileDirection endDirection;
+                if (!input.startX.HasValue || !input.startY.HasValue ||
+                    !input.endX.HasValue || !input.endY.HasValue ||
+                    !TryParseDirection(input.startDirection, out startDirection) ||
+                    !TryParseDirection(input.endDirection, out endDirection))
+                    return new ApiResponse(400,
+                        "{\"success\":false,\"error\":\"Expected motorway endpoints and directions\"}");
+                Vector2Int start = new Vector2Int(input.startX.Value, input.startY.Value);
+                Vector2Int end = new Vector2Int(input.endX.Value, input.endY.Value);
+                if (start == end)
+                    return new ApiResponse(400,
+                        "{\"success\":false,\"error\":\"Motorway endpoints must differ\"}");
+                City city = scope.Get<City>();
+                if (city == null)
+                    return new ApiResponse(503,
+                        "{\"success\":false,\"error\":\"City is unavailable\"}");
+                result = editor.AddMotorway(tilemapView, city.NextMotorwayId,
+                    tilemapView.GetLowestAvailableMotorwayNumber(), start, startDirection,
+                    end, endDirection, -1);
+            }
+            else
+                return new ApiResponse(400, JsonConvert.SerializeObject(new
+                {
+                    success = false,
+                    error = "Unknown action type",
+                    type = input.type
+                }));
+
+            bool isLegal = result.IsSuccessful;
+            string resultCode = result.resultCode.ToString();
+            object errorPosition = isLegal ? null : (object)new
+            {
+                x = result.errorPosition.x,
+                y = result.errorPosition.y
+            };
+            if (result.edit != null)
+                scope.Release(result.edit);
+            return LegalActionResponse(type, isLegal, resultCode, errorPosition);
+        }
+
+        private static bool TryParseDirection(string value, out TileDirection direction)
+        {
+            return Enum.TryParse(value, true, out direction) &&
+                direction != TileDirection.None && (int)direction >= 0 && (int)direction <= 7;
+        }
+
+        private static ApiResponse LegalActionResponse(string type, bool legal,
+            string resultCode, object errorPosition)
+        {
+            return new ApiResponse(200, JsonConvert.SerializeObject(new
+            {
+                success = true,
+                type = type,
+                legal = legal,
+                resultCode = resultCode,
+                errorPosition = errorPosition
+            }));
+        }
+
+        private static bool IsKnownEventReason(string reason)
+        {
+            return reason == "houseAdded" || reason == "destinationAdded" ||
+                reason == "upgradeAvailable" ||
+                reason == "overcrowdingWarning" || reason == "overcrowdingStarted" ||
+                reason == "terminal";
+        }
+
+        private long RecordGameEvent(string reason, object detail,
+            Server.ISimulation simulation = null)
+        {
+            int? tick;
+            double? simulationTime;
+            if (simulation == null)
+                GetCurrentSimulationPosition(out tick, out simulationTime);
+            else
+                CaptureSimulationPosition(simulation, out tick, out simulationTime);
+
+            GameEventRecord record;
+            lock (eventRecordsLock)
+            {
+                record = eventRecords.Count == 0 ? null : eventRecords[eventRecords.Count - 1];
+                if (record == null || record.episodeId != episodeId ||
+                    record.simulationTick != tick)
+                {
+                    record = new GameEventRecord
+                    {
+                        eventId = ++nextEventId,
+                        episodeId = episodeId,
+                        simulationTick = tick,
+                        simulationTime = simulationTime,
+                        timestamp = DateTime.UtcNow
+                    };
+                    eventRecords.Add(record);
+                    if (eventRecords.Count > MaxEventRecords)
+                        eventRecords.RemoveAt(0);
+                }
+                if (!record.reasons.Contains(reason))
+                    record.reasons.Add(reason);
+                if (detail != null)
+                    record.details.Add(detail);
+            }
+
+            lock (decisionLock)
+            {
+                if ((decisionMode == "agent" || decisionMode == "rl") &&
+                    autoPauseReasons.Contains(reason))
+                {
+                    pendingCriticalReasons.Add(reason);
+                    pendingCriticalEventId = record.eventId;
+                }
+            }
+            return record.eventId;
+        }
+
+        private void EvaluateDecisionPolicy(Server.ISimulation simulation)
+        {
+            int? tick;
+            double? simulationTime;
+            CaptureSimulationPosition(simulation, out tick, out simulationTime);
+            if (!tick.HasValue || !simulationTime.HasValue)
+                return;
+
+            var reasons = new List<string>();
+            long? boundaryEventId = null;
+            bool intervalDue = false;
+            lock (decisionLock)
+            {
+                if (decisionMode == "off" || decisionPending || decisionCapturePending)
+                    return;
+                reasons.AddRange(pendingCriticalReasons);
+                boundaryEventId = pendingCriticalEventId;
+                intervalDue = decisionMode == "rl" &&
+                    simulationTime.Value - lastDecisionActionSimulationTime >=
+                    minimumSimulationInterval;
+            }
+
+            if (intervalDue)
+            {
+                if (!reasons.Contains("interval"))
+                    reasons.Add("interval");
+                boundaryEventId = RecordGameEvent("interval", new
+                {
+                    elapsedSimulationTime = simulationTime.Value -
+                        lastDecisionActionSimulationTime
+                }, simulation);
+            }
+            if (reasons.Count == 0)
+                return;
+
+            lock (decisionLock)
+            {
+                if (decisionMode == "off" || decisionPending || decisionCapturePending)
+                    return;
+                decisionCapturePending = true;
+                stagedDecisionEventId = boundaryEventId;
+                stagedDecisionTick = tick;
+                stagedDecisionSimulationTime = simulationTime;
+                stagedDecisionReasons = reasons;
+                pendingCriticalReasons.Clear();
+                pendingCriticalEventId = null;
+            }
+
+            GameUIScreen gameUI = UnityEngine.Object.FindObjectOfType<GameUIScreen>();
+            if (gameUI != null && gameUI.GetTimeScaleMode().ToString() != "Paused")
+                gameUI.OnPausePressed();
+            AdvancePendingDecisionBoundary();
+        }
+
+        private void AdvancePendingDecisionBoundary()
+        {
+            lock (decisionLock)
+            {
+                if (!decisionCapturePending || decisionMode == "off")
+                    return;
+            }
+
+            GameUIScreen gameUI = UnityEngine.Object.FindObjectOfType<GameUIScreen>();
+            if (gameUI == null || gameUI.GetTimeScaleMode().ToString() != "Paused")
+                return;
+
+            GameSnapshot snapshot = CaptureSnapshot();
+            lock (decisionLock)
+            {
+                // Pause transitions can take another Unity update. Publish the
+                // boundary only after the game reports Paused, and publish its
+                // immutable snapshot atomically with the decision metadata.
+                if (!decisionCapturePending || decisionMode == "off" || decisionPending)
+                    return;
+                decisionPending = true;
+                decisionCapturePending = false;
+                decisionEventId = stagedDecisionEventId;
+                decisionTick = stagedDecisionTick;
+                decisionSimulationTime = stagedDecisionSimulationTime;
+                decisionReasons = stagedDecisionReasons;
+                stagedDecisionEventId = null;
+                stagedDecisionTick = null;
+                stagedDecisionSimulationTime = null;
+                stagedDecisionReasons = new List<string>();
+                decisionSnapshot = snapshot;
+            }
+        }
+
         private static bool TryGetUpgradeState(out GameUpgradeScreen upgradeScreen,
             out UpgradeDatabaseModel database, out int[] buttonMapping)
         {
@@ -1071,16 +1907,84 @@ namespace Moretoways
             // edit to the tile views, schedule the simulation command, then
             // track the pending edit in the client upgrade database.
             ClientTileEdit clientEdit = tilemapView.GenerateClientTileEditAndAddEditToViews(result.edit, false);
-            bool scheduled = simulation.ScheduleCommand(EditTileCommand.Create(scope, result.edit));
+            EditTileCommand command = EditTileCommand.Create(scope, result.edit);
+            bool scheduled = simulation.ScheduleCommand(command);
             clientEdit.isScheduledOnSimulation = scheduled;
             if (scheduled)
+            {
                 clientUpgrades.AddTileEdit(clientEdit);
+                RegisterScheduledEdit(command, activeActionId, simulation);
+            }
             return new ApiResponse(scheduled ? 202 : 409, JsonConvert.SerializeObject(new
             {
                 success = scheduled,
                 scheduled = scheduled,
                 resultCode = scheduled ? "Scheduled" : "ScheduleRejected"
             }));
+        }
+
+        private void RegisterScheduledEdit(EditTileCommand command, string actionId,
+            Server.ISimulation simulation)
+        {
+            if (command == null || actionId == null)
+                return;
+
+            int? tick;
+            double? simulationTime;
+            CaptureSimulationPosition(simulation, out tick, out simulationTime);
+            lock (actionRecordsLock)
+            {
+                ActionRecord record;
+                if (!actionRecords.TryGetValue(actionId, out record))
+                    return;
+                pendingEditActions[command] = actionId;
+                record.scheduledCommands++;
+                record.state = "scheduled";
+                if (!record.scheduledAt.HasValue)
+                {
+                    record.scheduledAt = DateTime.UtcNow;
+                    record.scheduledTick = tick;
+                    record.scheduledSimulationTime = simulationTime;
+                }
+            }
+        }
+
+        private void MarkEditFinished(EditTileCommand command, Server.ISimulation simulation,
+            Exception exception)
+        {
+            if (command == null)
+                return;
+
+            int? tick;
+            double? simulationTime;
+            CaptureSimulationPosition(simulation, out tick, out simulationTime);
+            lock (actionRecordsLock)
+            {
+                string actionId;
+                if (!pendingEditActions.TryGetValue(command, out actionId))
+                    return;
+                pendingEditActions.Remove(command);
+
+                ActionRecord record;
+                if (!actionRecords.TryGetValue(actionId, out record))
+                    return;
+                if (exception == null)
+                    record.executedCommands++;
+                else
+                {
+                    record.failedCommands++;
+                    record.state = "rejected";
+                    record.resultCode = "ExecutionFailed";
+                    record.error = exception.GetType().Name + ": " + exception.Message;
+                    record.executedAt = DateTime.UtcNow;
+                    record.executedTick = tick;
+                    record.executedSimulationTime = simulationTime;
+                }
+                if (record.submissionComplete &&
+                    record.failedCommands == 0 &&
+                    record.executedCommands >= record.scheduledCommands)
+                    MarkActionExecuted(record, tick, simulationTime);
+            }
         }
 
         private bool TryGetGameNavigation(out ScreenStack screenStack,
@@ -1331,7 +2235,7 @@ namespace Moretoways
             }));
         }
 
-        private static ApiResponse SetGamePaused(bool paused)
+        private ApiResponse SetGamePaused(bool paused)
         {
             var gameUI = UnityEngine.Object.FindObjectOfType<GameUIScreen>();
             if (gameUI == null)
@@ -1342,7 +2246,23 @@ namespace Moretoways
             if (paused)
                 gameUI.OnPausePressed();
             else
+            {
                 gameUI.OnPlayPressed();
+                lock (decisionLock)
+                {
+                    decisionPending = false;
+                    decisionCapturePending = false;
+                    decisionEventId = null;
+                    decisionTick = null;
+                    decisionSimulationTime = null;
+                    decisionReasons.Clear();
+                    stagedDecisionEventId = null;
+                    stagedDecisionTick = null;
+                    stagedDecisionSimulationTime = null;
+                    stagedDecisionReasons.Clear();
+                    decisionSnapshot = null;
+                }
+            }
 
             string currentMode = gameUI.GetTimeScaleMode().ToString();
             return new ApiResponse(200, JsonConvert.SerializeObject(new
@@ -1363,6 +2283,9 @@ namespace Moretoways
             var snapshot = new GameSnapshot
             {
                 snapshotId = ++snapshotId,
+                episodeId = episodeId,
+                terminalReason = terminalReason,
+                terminalDestinationBuildingId = terminalDestinationBuildingId,
                 editCommandsExecuted = this.editCommandsExecuted,
                 timestamp = DateTime.UtcNow,
                 phase = gameOverUI != null ? "gameOver" : gameUI != null ? "playing" : "menu",
@@ -1382,6 +2305,8 @@ namespace Moretoways
             }
 
             var currentGame = Traverse.Create(gameUI).Field("_game").GetValue<MotorwaysGame>();
+            var city = currentGame == null ? null :
+                Traverse.Create(currentGame).Field("_city").GetValue<City>();
             if (currentGame != null && currentGame.MapDefinition != null)
                 snapshot.map = currentGame.MapDefinition.cityName;
 
@@ -1404,7 +2329,42 @@ namespace Moretoways
             var clockView = Traverse.Create(gameUI).Field("_clockView").GetValue<ClockView>();
             var clock = clockView != null ? clockView.ClockModel : null;
             if (clock != null)
+            {
                 snapshot.clock = new { time = (double)clock.Time, hour = clock.Hour, day = clock.Day, week = clock.Week };
+                if (clock.Clock != null)
+                {
+                    snapshot.simulationTick = clock.Clock.FrameCount;
+                    snapshot.simulationTime = (double)clock.Clock.Time;
+                }
+            }
+            if (city != null && city.Definition != null)
+            {
+                RectInt full = city.Definition.PlayableArea;
+                object current = null;
+                if (clock != null)
+                {
+                    FixMath.RectFixed area = city.GetSimulationPlayableAreaAtTime(
+                        clock.Time, City.PlayableAreaRoundingType.ForceWholeTiles);
+                    current = new
+                    {
+                        minX = (double)area.xMin,
+                        minY = (double)area.yMin,
+                        maxX = (double)area.xMax,
+                        maxY = (double)area.yMax
+                    };
+                }
+                snapshot.mapBounds = new
+                {
+                    full = new
+                    {
+                        minX = full.xMin,
+                        minY = full.yMin,
+                        maxX = full.xMax,
+                        maxY = full.yMax
+                    },
+                    current = current
+                };
+            }
 
             var upgrades = Traverse.Create(gameUI).Field("_upgradeDatabaseModel").GetValue<UpgradeDatabaseModel>();
             if (upgrades != null)
@@ -1466,7 +2426,8 @@ namespace Moretoways
                     foreach (var entry in tiles)
                     {
                         if (entry.Value != null && entry.Value.Tile != null)
-                            snapshot.tiles.Add(CaptureTile(entry.Key, entry.Value.Tile));
+                            snapshot.tiles.Add(CaptureTile(entry.Key, entry.Value,
+                                city, clock));
                     }
                 }
             }
@@ -1480,8 +2441,10 @@ namespace Moretoways
             return snapshot;
         }
 
-        private static TileSnapshot CaptureTile(Vector2Int coordinates, Tile tile)
+        private static TileSnapshot CaptureTile(Vector2Int coordinates,
+            TileModel tileModel, City city, ClockModel clock)
         {
+            Tile tile = tileModel.Tile;
             var roads = new Dictionary<string, string>();
             for (int directionIndex = 0; directionIndex < 8; directionIndex++)
             {
@@ -1588,7 +2551,64 @@ namespace Moretoways
                 hasTrafficLight = tile.HasTrafficLight,
                 isRoundabout = tile.IsCenterOfRoundabout,
                 drivewayDirection = tile.DrivewayDirection.ToString(),
-                unbuiltMotorwayId = tile.UnbuiltMotorwayId
+                unbuiltMotorwayId = tile.UnbuiltMotorwayId,
+                terrain = CaptureTerrain(coordinates, city, clock),
+                traffic = CaptureTraffic(tileModel)
+            };
+        }
+
+        private static object CaptureTerrain(Vector2Int coordinates, City city,
+            ClockModel clock)
+        {
+            CityDefinition definition = city == null ? null : city.Definition;
+            if (definition == null)
+                return null;
+            return new
+            {
+                buildable = definition.TileIsBuildable(coordinates),
+                zoneable = definition.TileIsZoneable(coordinates),
+                driveable = definition.TileIsDriveable(coordinates),
+                water = definition.TileIsOverWater(coordinates),
+                mountain = definition.TileIsUnderAMountain(coordinates),
+                currentlyPlayable = clock != null &&
+                    city.IsTileInPlayableArea(coordinates, clock.Time)
+            };
+        }
+
+        private static object CaptureTraffic(TileModel tileModel)
+        {
+            RoadChunkModel chunk = tileModel == null ? null : tileModel.roadChunk;
+            if (chunk == null || chunk.lanes == null || chunk.lanes.Count == 0)
+                return null;
+
+            var vehicleIds = new HashSet<int>();
+            int stoppedVehicles = 0;
+            double totalSpeed = 0d;
+            foreach (LaneModel lane in chunk.lanes)
+            {
+                if (lane == null || lane.Vehicles == null)
+                    continue;
+                foreach (VehicleModel vehicle in lane.Vehicles)
+                {
+                    if (vehicle == null)
+                        continue;
+                    int vehicleId = Traverse.Create(vehicle).Field("id").GetValue<int>();
+                    if (!vehicleIds.Add(vehicleId))
+                        continue;
+                    object frame = vehicle.CurrentFrame;
+                    double speed = frame == null ? 0d :
+                        (double)Traverse.Create(frame).Field("speed").GetValue<FixMath.Fix64>();
+                    totalSpeed += speed;
+                    if (speed <= 0.01d)
+                        stoppedVehicles++;
+                }
+            }
+            return new
+            {
+                laneCount = chunk.lanes.Count,
+                vehicleCount = vehicleIds.Count,
+                stoppedVehicleCount = stoppedVehicles,
+                averageSpeed = vehicleIds.Count == 0 ? 0d : totalSpeed / vehicleIds.Count
             };
         }
 
@@ -1693,12 +2713,18 @@ namespace Moretoways
                     return JsonConvert.SerializeObject(new
                     {
                         success = true, snapshotId = snapshot.snapshotId,
+                        episodeId = snapshot.episodeId,
+                        simulationTick = snapshot.simulationTick,
+                        simulationTime = snapshot.simulationTime,
                         count = snapshot.tileCount, tiles = snapshot.tiles, timestamp = snapshot.timestamp
                     });
                 case "/tiles/count":
                     return JsonConvert.SerializeObject(new
                     {
                         success = true, snapshotId = snapshot.snapshotId,
+                        episodeId = snapshot.episodeId,
+                        simulationTick = snapshot.simulationTick,
+                        simulationTime = snapshot.simulationTime,
                         count = snapshot.tileCount, timestamp = snapshot.timestamp
                     });
                 case "/destinations":
@@ -1709,12 +2735,20 @@ namespace Moretoways
                     return JsonConvert.SerializeObject(new
                     {
                         success = true, snapshotId = snapshot.snapshotId,
+                        episodeId = snapshot.episodeId,
+                        simulationTick = snapshot.simulationTick,
+                        simulationTime = snapshot.simulationTime,
                         count = destinations.Count, destinations = destinations, timestamp = snapshot.timestamp
                     });
                 case "/game/status":
                     return JsonConvert.SerializeObject(new
                     {
                         success = true, snapshotId = snapshot.snapshotId,
+                        episodeId = snapshot.episodeId,
+                        simulationTick = snapshot.simulationTick,
+                        simulationTime = snapshot.simulationTime,
+                        terminalReason = snapshot.terminalReason,
+                        terminalDestinationBuildingId = snapshot.terminalDestinationBuildingId,
                         editCommandsExecuted = snapshot.editCommandsExecuted,
                         phase = snapshot.phase, gameUI = snapshot.gameUI,
                         tilemapView = snapshot.tilemapView, camera = snapshot.camera,
@@ -1773,6 +2807,15 @@ namespace Moretoways
                 pluginInstance.editCommandsExecuted++;
         }
 
+        [HarmonyFinalizer, HarmonyPatch(typeof(EditTileCommand), "Execute")]
+        private static Exception OnEditCommandFinished(EditTileCommand __instance,
+            Server.ISimulation simulation, Exception __exception)
+        {
+            if (pluginInstance != null)
+                pluginInstance.MarkEditFinished(__instance, simulation, __exception);
+            return __exception;
+        }
+
         [HarmonyPrefix, HarmonyPatch(typeof(InitCityCommand), "CreateNormalCity")]
         private static void UseFixedSimulationSeed(ref uint seed)
         {
@@ -1804,6 +2847,7 @@ namespace Moretoways
                 // restarts, and newly started games all begin at snapshot 1.
                 pluginInstance.snapshotId = 0;
                 pluginInstance.initialSimulationSeed = seed;
+                pluginInstance.BeginEpisode();
                 if (pluginInstance.newGameLaunch != null &&
                     pluginInstance.newGameLaunch.State == "ready")
                     pluginInstance.newGameLaunch = null;
@@ -1812,6 +2856,161 @@ namespace Moretoways
                     seed == pluginInstance.newGameLaunch.Seed)
                     pluginInstance.newGameLaunch.State = "initializing";
             }
+        }
+
+        private void BeginEpisode()
+        {
+            string previousEpisodeId = episodeId;
+            string newEpisodeId = Guid.NewGuid().ToString("N");
+            lock (actionRecordsLock)
+            {
+                foreach (ActionRecord record in actionRecords.Values)
+                {
+                    if (record.awaitingEpisodeStart && record.state == "scheduled")
+                    {
+                        record.resultingEpisodeId = newEpisodeId;
+                        MarkActionExecuted(record, 0, 0d);
+                        continue;
+                    }
+                    if (record.episodeId == previousEpisodeId &&
+                        (record.state == "queued" || record.state == "scheduled"))
+                    {
+                        record.state = "expired";
+                        record.resultCode = "EpisodeChanged";
+                        record.error = "Episode ended before this action executed";
+                    }
+                }
+                pendingEditActions.Clear();
+            }
+            episodeId = newEpisodeId;
+            terminalReason = null;
+            terminalDestinationBuildingId = null;
+            activeOvercrowdingDestinations.Clear();
+            warnedOvercrowdingDestinations.Clear();
+            lock (decisionLock)
+            {
+                lastDecisionActionSimulationTime = 0d;
+                decisionPending = false;
+                decisionCapturePending = false;
+                decisionEventId = null;
+                decisionTick = null;
+                decisionSimulationTime = null;
+                decisionReasons.Clear();
+                stagedDecisionEventId = null;
+                stagedDecisionTick = null;
+                stagedDecisionSimulationTime = null;
+                stagedDecisionReasons.Clear();
+                pendingCriticalReasons.Clear();
+                pendingCriticalEventId = null;
+                decisionSnapshot = null;
+            }
+            Logger.LogInfo("Started API episode " + episodeId);
+        }
+
+        [HarmonyPrefix, HarmonyPatch(typeof(GameplayEventHandler), "EndGame")]
+        private static void CaptureTerminalReason(GameplayEventHandler __instance,
+            DestinationView failedOnDestination)
+        {
+            if (pluginInstance == null)
+                return;
+            pluginInstance.terminalReason = failedOnDestination == null ?
+                "gameEnded" : "overcrowding";
+            pluginInstance.terminalDestinationBuildingId = failedOnDestination == null ?
+                null : GetDestinationBuildingId(failedOnDestination.Model);
+            Server.ISimulation simulation = Traverse.Create(__instance)
+                .Field("_simulation").GetValue<Server.ISimulation>();
+            pluginInstance.RecordGameEvent("terminal", new
+            {
+                reason = pluginInstance.terminalReason,
+                destinationBuildingId = pluginInstance.terminalDestinationBuildingId
+            }, simulation);
+        }
+
+        [HarmonyPostfix, HarmonyPatch(typeof(HouseModel), "Initialize")]
+        private static void OnHouseInitialized(HouseModel __instance)
+        {
+            if (pluginInstance == null)
+                return;
+            Server.ISimulation simulation = Traverse.Create(__instance)
+                .Field("_simulation").GetValue<Server.ISimulation>();
+            pluginInstance.RecordGameEvent("houseAdded", new
+            {
+                buildingId = GetHouseBuildingId(__instance),
+                groupIndex = __instance.GroupIndex
+            }, simulation);
+        }
+
+        [HarmonyPostfix, HarmonyPatch(typeof(DestinationModel), "Initialize")]
+        private static void OnDestinationInitialized(DestinationModel __instance)
+        {
+            if (pluginInstance == null)
+                return;
+            Server.ISimulation simulation = Traverse.Create(__instance)
+                .Field("_simulation").GetValue<Server.ISimulation>();
+            pluginInstance.RecordGameEvent("destinationAdded", new
+            {
+                buildingId = GetDestinationBuildingId(__instance),
+                groupIndex = __instance.GroupIndex
+            }, simulation);
+        }
+
+        [HarmonyPostfix, HarmonyPatch(typeof(UpgradeDatabaseModel), "AddPendingUpgradeChoice")]
+        private static void OnUpgradeAvailable(UpgradeDatabaseModel __instance)
+        {
+            if (pluginInstance != null)
+                pluginInstance.RecordGameEvent("upgradeAvailable", new
+                {
+                    pendingCount = __instance.pendingUpgradeChoices.Count
+                });
+        }
+
+        [HarmonyPostfix, HarmonyPatch(typeof(DestinationView), "CreateImminentFailAlert")]
+        private static void OnOvercrowdingWarning(DestinationView __instance)
+        {
+            if (pluginInstance == null || __instance == null)
+                return;
+            string buildingId = GetDestinationBuildingId(__instance.Model);
+            if (buildingId == null ||
+                !pluginInstance.warnedOvercrowdingDestinations.Add(buildingId))
+                return;
+            pluginInstance.RecordGameEvent("overcrowdingWarning", new
+            {
+                destinationBuildingId = buildingId
+            });
+        }
+
+        [HarmonyPostfix, HarmonyPatch(typeof(DestinationModel), "SetNextFrameOvercrowdingSpeed")]
+        private static void OnOvercrowdingSpeedChanged(DestinationModel __instance,
+            FixMath.Fix64 speed)
+        {
+            if (pluginInstance == null || __instance == null)
+                return;
+            string buildingId = GetDestinationBuildingId(__instance);
+            if ((double)speed > 0d)
+            {
+                if (buildingId != null &&
+                    pluginInstance.activeOvercrowdingDestinations.Add(buildingId))
+                {
+                    Server.ISimulation simulation = Traverse.Create(__instance)
+                        .Field("_simulation").GetValue<Server.ISimulation>();
+                    pluginInstance.RecordGameEvent("overcrowdingStarted", new
+                    {
+                        destinationBuildingId = buildingId
+                    }, simulation);
+                }
+            }
+            else if (buildingId != null)
+            {
+                pluginInstance.activeOvercrowdingDestinations.Remove(buildingId);
+                pluginInstance.warnedOvercrowdingDestinations.Remove(buildingId);
+            }
+        }
+
+        [HarmonyPostfix, HarmonyPatch(typeof(MotorwaysGame), "Tick")]
+        private static void OnSimulationTickFinished(MotorwaysGame __instance)
+        {
+            if (pluginInstance != null && __instance != null && !__instance.HasGameEnded)
+                pluginInstance.EvaluateDecisionPolicy(__instance.Simulation);
         }
 
         [HarmonyPrefix, HarmonyPatch(typeof(PauseScreen), "RestartGame")]

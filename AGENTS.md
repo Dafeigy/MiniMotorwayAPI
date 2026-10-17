@@ -19,7 +19,7 @@ After changing plugin code:
 2. Validate any changed Python test files without creating cache files, for example:
    `python -c "from pathlib import Path; compile(Path('tests/apitest.py').read_text(encoding='utf-8'), 'tests/apitest.py', 'exec')"`.
 3. Build a Release plugin into a repository-local staging directory instead of writing directly to the game installation:
-   `dotnet msbuild Moretoways.csproj /t:Build /p:Configuration=Release /p:OutputPath=bin\DeployRelease\`.
+   `dotnet msbuild Moretoways.csproj /restore /t:Build /p:GameDir="F:\SteamLibrary\steamapps\common\Mini Motorways" /p:Configuration=Release /p:OutputPath=bin\DeployRelease\`.
 4. Treat a successful build as compile verification only. Runtime behavior still needs to be checked in the game.
 
 The current game installation is:
