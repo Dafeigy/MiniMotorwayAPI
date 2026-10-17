@@ -1,81 +1,165 @@
-# P0：Agent 与强化学习控制接口实施方案
+# P0 Agent and Reinforcement-Learning Control Plan
 
-本文记录已讨论确认的 P0 方向，并作为实现与验收清单。现有 `/snapshot`、道路编辑、重开和暂停/继续接口保持兼容。P0 不增加客户端指定模拟时长的 `/game/step`，也不增加批量编辑；铺路时逐条提交编辑。
+**English** | [简体中文](p0-agent-rl-plan.zh-CN.md)
 
-外部基准项目的工具与观测设计对比，以及本项目需要保留的原生模拟边界，见 [Silicon Rider Bench 对 Agent 接口的启示](silicon-rider-lessons.md)。
+This document records the agreed P0 direction and serves as the implementation
+and acceptance checklist. Existing `/snapshot`, road-edit, restart, and
+pause/resume behavior remains compatible. P0 does not add a client-controlled
+`/game/step` duration or batch edits; roads are submitted one edit at a time.
 
-## 决策边界
+For lessons from an external benchmark and the native simulation boundaries
+that this project must preserve, see [Lessons from Silicon Rider Bench for the
+Agent API](silicon-rider-lessons.md).
 
-同一套事件、快照和动作记录支持两种控制方式：
+## Decision boundaries
 
-| 使用方 | 何时观察与决策 | 游戏运行方式 |
+The same events, snapshots, and action records support two control styles:
+
+| Consumer | Observation/decision point | Game behavior |
 | --- | --- | --- |
-| Agent | 轮询轻量事件元数据，自行判断是否暂停；关键事件可配置为自动暂停 | 思考和铺路期间暂停，完成后继续 |
-| RL 模型 | 距上次动作实际执行已达到设定的游戏内时间间隔，或发生需要提前处理的关键事件 | 到达决策边界自动暂停；模型推理和动作提交期间保持暂停 |
+| Agent | Poll lightweight event metadata, decide whether to pause; selected critical events can auto-pause | Pause while reasoning/editing, then resume |
+| RL model | Minimum native simulation interval since the latest executed action, or an earlier critical event | Auto-pause at the boundary; remain paused during inference and action submission |
 
-决策间隔以游戏的模拟时间或原生模拟 tick 计量，不以 HTTP 到达时间或现实时间计量。暂停边界应在一次模拟更新完成之后，先确定事件与当前状态，再捕获快照。一个边界上的多个事件合并为一条记录，使用 `reasons` 数组表达。无动作的决策直接继续游戏。
+Intervals use native simulation time/ticks, not HTTP arrival time or wall time.
+A boundary is selected after a simulation update; events and current state are
+resolved before one snapshot is captured. Multiple reasons in the same
+boundary are merged into a `reasons` array. A no-action decision resumes after
+an explicit no-op.
 
-普通事件允许 Agent 自行轮询和暂停。事件发生与实际暂停之间可能经过多个模拟 tick，因此事件记录必须保存发生时的 tick，快照必须保存实际捕获时的 tick。需要即时处理的事件支持自动暂停。事件至少包括新房屋、新目的地、待选周升级、过载预警/开始和终局；停车场随目的地出现时只生成一个决策事件。具体游戏钩子和“预警”的可用提前量要通过运行验证确定。
+Normal events can be polled and paused by the Agent. Because event occurrence
+and pause can be separated by several simulation ticks, the event stores its
+occurrence tick while the snapshot stores the actual capture tick. Events that
+need immediate handling can auto-pause. Required events include new houses,
+new destinations, weekly upgrades, overcrowding warning/start, and terminal
+state. A destination and its carpark create one decision event. Exact hook
+timing remains game-version dependent and must be verified at runtime.
 
-## 接口与数据约定
+## Protocol and data contract
 
-下面是目标契约，新增字段和端点按阶段交付；尚未实现的内容不能视为当前 API 行为。
+The following is the target contract; only delivered fields/endpoints are
+current API behavior.
 
-1. `GET /events?after=<eventId>` 只读取有界事件日志和少量元数据，不遍历 tile、车辆，也不构建完整快照。响应包括最新 `eventId`、事件列表和是否出现日志缺口。客户端用 `eventId` 去重；若日志溢出，返回明确的缺口标记，要求重新读取快照。
-2. `/snapshot` 增加 `episodeId`、原生模拟时间标识、实际捕获时的事件标识，以及终局原因。`snapshotId` 继续表示 API 捕获序号，不能当作模拟 tick。相同决策边界的重复读取返回同一份不可变快照，不重复扫描地图。
-3. 状态变更请求带客户端生成的 `requestId`（优先使用 HTTP 头，以兼容没有请求体的控制接口）。同一局内同一个 ID 和同一请求内容只执行一次；同 ID 不同内容返回冲突。旧客户端可以不带 ID，但只能得到服务端生成的 ID，不能依赖跨重试幂等。
-4. 动作有 `actionId` 和明确状态：`queued`、`scheduled`、`executed`、`rejected`、`expired`。HTTP 202 只代表接受或调度，不代表模拟已经执行。提供按 ID 查询最终结果的接口，并记录动作实际执行的模拟时间。过期且尚未开始的请求不能在 HTTP 超时后继续执行。
-5. RL 决策间隔从上次动作**实际执行**的模拟时间计算。新事件需要提前决策时可以打断间隔；响应明确此次边界的原因和距离上次动作的实际模拟时长。终局必须总能产生可观察事件和最终快照。
+1. `GET /events?after=<eventId>` reads a bounded lightweight event log without
+   scanning tiles/vehicles or building a full snapshot. It returns the latest
+   ID, event list, and an explicit gap flag. Clients deduplicate by `eventId`;
+   after overflow they refresh the full snapshot.
+2. `/snapshot` includes `episodeId`, native simulation position, the observed
+   event boundary, and terminal reason. `snapshotId` remains a capture sequence,
+   not a simulation tick. Reads at one decision boundary reuse one immutable
+   snapshot.
+3. State-changing requests carry a client-generated `requestId`, preferably in
+   an HTTP header for bodyless controls. The same ID and content execute at
+   most once within a run; conflicting content is rejected. Legacy clients can
+   omit the ID but cannot safely retry a lost response.
+4. Actions have an `actionId` and explicit `queued`, `scheduled`, `executed`,
+   `rejected`, or `expired` state. HTTP `202` only means accepted/scheduled.
+   Final results include native execution time. A queued request that expires
+   must not execute later.
+5. RL intervals begin at the latest action's **actual execution** time. A
+   critical event can interrupt the interval. Terminal state always produces
+   an observable event and final snapshot.
 
-暂停时的道路编辑会先返回“已调度”。本次游戏实测中，四条编辑命令随后在 `timeScaleMode=Paused`、游戏时钟不变的情况下陆续执行，因此不能假定一定要等恢复运行。Agent 可以逐条提交并通过后续快照确认实际道路与资源变化。实现时还要检查调度失败后客户端视图是否需要回滚。
+Paused road edits first return scheduled. Live tests showed native edit
+commands completing while `timeScaleMode=Paused` and the game clock remained
+fixed, so clients must not assume resume is required. Submit edits individually
+and confirm their later snapshot/action state.
 
-## 开发顺序与验收
+## Implementation order and acceptance
 
-### 0. 编译基线
+### 0. Compile baseline
 
-- 修复当前未提交 Logo 改动中的 C# 语法错误，保留该改动的用途。
-- Release 构建写入仓库内暂存目录，不直接覆盖游戏插件。
+- Fix the C# syntax in the pending Logo change while preserving its purpose.
+- Write Release builds to a repository staging directory, never directly over
+  the installed plugin.
 
-### 1. 请求生命周期与幂等
+### 1. Request lifecycle and idempotency
 
-- 为主线程请求加入入队时间、截止时间和状态转换；超时后对尚未开始的请求做原子取消。
-- 为状态变更请求加入 `requestId` 与内容冲突检测，保存结果供重试查询。
-- 验收：主线程停顿超过 HTTP 超时后恢复，过期动作不执行；重复请求最多执行一次；同 ID 不同内容被拒绝。
+- Add enqueue time, deadline, and atomic state transitions. Cancel requests
+  that expire before starting.
+- Add `requestId`, conflict detection, and stored replay results.
+- Accept when: a request queued through a main-thread stall never executes
+  after expiry; duplicate requests execute once; conflicting reuse is rejected.
 
-### 2. 局、模拟时间与动作最终结果
+### 2. Episode, simulation time, and final action result
 
-- 在新局初始化和终局钩子建立 `episodeId` 和终局原因；从游戏模拟边界取得稳定的时间标识。
-- 将模拟命令的调度与执行结果关联到 `actionId`，记录执行时间；保留现有接口的即时响应语义。
-- 验收：重开后旧局动作不能混入新局；道路修改可查询最终结果；快照与动作的时间顺序可解释。
+- Create `episodeId` at native game initialization and record terminal cause.
+- Associate scheduled simulation commands with `actionId` and record their
+  actual execution time without changing existing immediate responses.
+- Accept when: old actions cannot leak across restart; road changes reach a
+  final result; snapshot/action time ordering is explainable.
 
-### 3. 轻量事件与两种决策策略
+### 3. Lightweight events and two decision policies
 
-- 通过游戏原生事件钩子或低开销状态检查生成有界事件日志；`GET /events` 不捕获完整快照。
-- Agent 可轮询事件并自行暂停；关键事件可选自动暂停。RL 按模拟时间间隔自动暂停，同一边界只捕获一次快照。
-- 验收：无事件轮询不引起整图扫描；同边界事件合并；暂停后不丢关键事件；模型推理时间不推进游戏。
+- Generate a bounded log from native hooks or low-cost checks. `/events` must
+  not capture a full snapshot.
+- Let Agents poll and optionally auto-pause critical events; let RL pause at a
+  native-time interval. Capture only one snapshot per boundary.
+- Accept when: no-event polling does not scan the map; same-tick reasons merge;
+  critical events survive pause; inference time does not advance simulation.
 
-### 4. 单项动作与决策所需观测
+### 4. Individual actions and decision observations
 
-- 增加周升级选择、红绿灯、环岛、高速公路及显式 no-op；每个动作单独提交和确认。
-- 增加地图边界、地形、高速公路端点、交通负载和合法动作信息。优先提供候选动作合法性查询，再评估整图动作掩码的成本。
-- 验收：每种动作覆盖成功、无效位置、资源不足、重复请求；观测字段与游戏画面/模型一致。
+- Add weekly upgrade, traffic light, roundabout, motorway, and explicit no-op
+  actions, each submitted and confirmed individually.
+- Add map bounds, terrain, motorway endpoints, traffic load, and legality
+  information. Start with one-candidate legality before evaluating a full mask.
+- Accept when: success, invalid position, insufficient resource, and duplicate
+  cases are covered; observation fields match native state and the UI.
 
-## 快照性能验证
+## Snapshot performance validation
 
-当前实现每次读接口都会在 Unity 主线程调用 `CaptureSnapshot()`，扫描车辆及全部 tile，并在主线程做 JSON 序列化；`/game/status` 也会先构建完整快照。开始事件与缓存开发前，须在运行游戏中按地图规模测量：主线程采集耗时、序列化耗时、JSON 大小、HTTP 总延迟及最慢帧影响。分别报告中位数和高位耗时。没有真实运行数据时不设想当然的性能数字。
+The current implementation captures each read on Unity's main thread, scans
+vehicles/tiles, and serializes JSON there. `/game/status` also builds a full
+snapshot. Measure capture, serialization, payload, end-to-end latency, and
+frame impact at different map sizes before assuming performance limits.
 
-已加入 `X-Snapshot-Capture-Ms`、`X-Snapshot-Serialize-Ms` 响应头和显式只读的 `python tests/apitest.py --benchmark-snapshot 20` 测量命令。响应头不包含排队等待或 HTTP 传输时间；脚本另测端到端延迟。在本次 19 tile 的新局中，20 次测量的中位数为采集 3.293 ms、序列化 0.239 ms、客户端总延迟 7.023 ms；总延迟的 p95 为 27.815 ms。该样本不能代表后期大地图。
+`X-Snapshot-Capture-Ms`, `X-Snapshot-Serialize-Ms`, and the read-only
+`python tests/apitest.py --benchmark-snapshot 20` command are implemented. The
+headers exclude queueing and transport; the script also measures client
+latency. For a 19-tile new game, 20 samples produced medians of 3.293 ms
+capture, 0.239 ms serialization, and 7.023 ms total, with 27.815 ms total p95.
 
-在 222 tile、72 vehicle、10 destination、3 motorway 的后期局面中，20 次测量的中位数为采集 4.775 ms、序列化 2.998 ms、客户端总延迟 13.800 ms；p95 分别为 5.385 ms、3.812 ms 和 36.847 ms，响应约 125395 bytes。该样本验证了当前低频控制用途，但尚未覆盖最极端地图或高频训练吞吐。
+For a later 222-tile, 72-vehicle, 10-destination, 3-motorway game, medians were
+4.775 ms capture, 2.998 ms serialization, and 13.800 ms total. P95 values were
+5.385 ms, 3.812 ms, and 36.847 ms; payload size was about 125,395 bytes. This
+supports low-frequency control but not extreme maps or high-throughput RL.
 
-事件轮询与动作状态查询应走轻量路径。完整快照只在需要观测时捕获，并复用同一决策边界的数据。将序列化迁离主线程、版本化协议和长期吞吐优化仍属于 P1，但若测量表明当前方式影响正常游戏帧率，应提前处理。
-P0 的缓存仅覆盖已暂停的同一决策边界；P1 再处理所有模拟边界的通用不可变观测管线。
+Event and action-status polling should remain lightweight. P0 caches the full
+snapshot only for one paused decision boundary. Moving serialization off the
+main thread, versioned protocols, and general immutable observation pipelines
+remain P1 unless measurements require earlier work.
 
-## 当前进度
+## Current progress
 
-- [x] 编译基线：保留并修正现有 Logo 改动，仓库内 Release 构建与游戏启动验证通过。
-- [ ] 请求生命周期与 HTTP 级幂等：`X-Request-Id`、排队超时取消、重复结果复用、`GET /requests?id=...` 已实现；同 ID 重试、内容冲突及重复道路请求只执行一次均已通过游戏内验证。主线程停顿时的超时取消仍待压测。该查询目前只报告 HTTP/主线程处理结果，不代表模拟命令最终执行。
-- [ ] 局、模拟时间与动作最终结果：`episodeId`、原生 `simulationTick`／`simulationTime`、终局原因、`actionId` 和 `GET /actions?id=...` 已实现。道路添加／清除均已验证从 `scheduled` 进入 `executed`，各关联一条完成的原生命令并记录执行时间；UI 重开会生成新 `episodeId`、保留固定种子，旧局 action 仅作为带旧 `episodeId` 的历史记录；真实终局会在快照记录 `overcrowding` 和失败目的地，并生成一致的 terminal 事件。高速公路聚合两条命令；API 新局／重开记录 `resultingEpisodeId`，旧局排队动作会过期。仍待验证 API 重开结果身份及排队动作跨局过期。
-- [x] 轻量事件与两种决策策略：有界 `GET /events?after=...`、`GET /decision/status`、`POST /decision/config`、Agent 关键事件暂停、RL 模拟时间间隔、同边界快照复用已实现并通过运行验收。房屋／目的地、周升级、过载开始／预警、终局事件，RL 间隔自动暂停，Agent `houseAdded` 关键事件自动暂停和同一 `snapshotId` 复用均已实际观测；决策只在游戏实际报告 `Paused` 后与不可变快照一起发布。事件读取不捕获完整快照。`eventId` 在插件进程内跨局递增，每条事件用自己的 `episodeId` 区分。
-- [ ] 单项动作与决策所需观测：周升级选择、交通灯、环岛、高速公路和显式 no-op 已在可丢弃游戏中验证。修正后的高速公路动作先排程未建成端点、再排程成品编辑；复测中执行命令数增加 2，快照新增一条 `Active` 高速公路且 `hasConsumedUpgrade: true`，可用资源从 1 降为 0。资源为 0 时再次提交返回 `422 NotEnoughUpgrades`，高速公路数量及编辑命令数不变。地图完整／当前边界、逐 tile 地形、道路块车辆负载、高速公路端点和单候选 `POST /actions/legal` 已实现；本轮已运行核对边界、地形、交通数据并用原生规则选出合法道路候选。整图动作掩码和系统化画面对照继续根据成本评估。
-- [ ] 运行游戏中的性能与行为验收：早期与 222 tile 后期地图的快照基准、道路增删与最终回执、UI 重开、主动重开、暂停/继续、一次实际送达、新增设施、高速公路动作和真实终局已验证；排队超时竞态及 API 重开结果身份仍待测。暂停/继续的即时 `changed/currentMode` 可能保留旧值，须以后续快照为准。
+- [x] Compile baseline: Logo fixed, repository-local Release build and startup verified.
+- [ ] Request lifecycle and HTTP idempotency: IDs, queued timeout cancellation,
+  replay, and `GET /requests` are implemented. Same-ID replay, conflicts, and
+  duplicate roads passed live tests. Main-thread-stall expiry still needs stress
+  testing. This endpoint reports HTTP/main-thread completion, not final native
+  command execution.
+- [ ] Episode, native time, and final action result: `episodeId`,
+  `simulationTick`/`simulationTime`, terminal cause, `actionId`, and
+  `GET /actions` are implemented. Road add/clear reached `executed`, each with
+  one completed native command and execution time. UI restart created a new
+  episode while preserving the seed; prior actions remained historical. A real
+  game over recorded `overcrowding`, its destination, and a matching terminal
+  event. Motorways aggregate two commands. API start/restart records
+  `resultingEpisodeId`; queued old-episode actions expire. API restart identity
+  and queued cross-episode expiry still need live coverage.
+- [x] Lightweight events and decision policies: house/destination, weekly
+  upgrade, overcrowding start/warning, and terminal events; RL interval pause;
+  Agent `houseAdded` auto-pause; and immutable snapshot reuse all passed live
+  validation. Decisions publish only after the game reports `Paused`. Event IDs
+  increase across episodes, and each event carries its episode ID.
+- [ ] Actions and observations: weekly upgrade, traffic light, roundabout,
+  motorway, and no-op passed disposable-game tests. The corrected motorway
+  schedules two native edits and consumes one upgrade; the insufficient-resource
+  case returns `422 NotEnoughUpgrades`. Full/current bounds, terrain, road-chunk
+  traffic, motorway endpoints, and single-candidate `/actions/legal` are
+  implemented and runtime checked. Full-mask cost and systematic visual
+  comparison remain open.
+- [ ] Runtime performance and behavior: early and 222-tile benchmarks, road
+  add/clear receipts, UI/API restart, pause/resume, a delivery, facilities,
+  motorway, and real terminal state were exercised. Main-thread timeout races
+  and API restart result identity remain. Immediate pause/resume
+  `changed/currentMode` can be stale; confirm via a later snapshot.

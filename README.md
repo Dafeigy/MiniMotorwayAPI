@@ -3,7 +3,18 @@
 BepInEx plugin for observing and controlling a running Mini Motorways game
 through a local HTTP API. Road and facility edits, motorway creation, weekly
 upgrade selection, active-game restart, and pause/resume are implemented.
-Simulation-time decision boundaries and final action receipts are still under development.
+Simulation-time decision boundaries, event-driven pauses, and final action
+receipts are implemented and runtime validated.
+
+## Documentation
+
+Canonical/default documentation is English. Simplified Chinese translations
+are maintained alongside it:
+
+- API reference: **[English](docs/api.md)** | [简体中文](docs/api.zh-CN.md)
+- Agent/RL P0 plan: **[English](docs/p0-agent-rl-plan.md)** | [简体中文](docs/p0-agent-rl-plan.zh-CN.md)
+- Silicon Rider lessons: **[English](docs/silicon-rider-lessons.md)** | [简体中文](docs/silicon-rider-lessons.zh-CN.md)
+- Snapshot roadmap: **[English](docs/snapshot-roadmap.md)** | [简体中文](docs/snapshot-roadmap.zh-CN.md)
 
 ## Build
 
@@ -186,12 +197,12 @@ seeds; restarting them also reuses the current seed by default.
 Use `GET /game/maps` to confirm which of these maps are present in the running
 game. For example:
 
-```powershell
-$maps = Invoke-RestMethod http://localhost:9000/game/maps
-$maps.maps
-$body = @{ map = 'LosAngeles'; seed = 12345; startPaused = $true } | ConvertTo-Json
-Invoke-RestMethod http://localhost:9000/game/new -Method Post -ContentType 'application/json' -Body $body
-Invoke-RestMethod http://localhost:9000/game/status
+```bash
+curl http://localhost:9000/game/maps
+curl -X POST http://localhost:9000/game/new \
+  -H "Content-Type: application/json" \
+  -d '{"map":"LosAngeles","seed":12345,"startPaused":true}'
+curl http://localhost:9000/game/status
 ```
 
 The request requires `map`; `seed` is an optional unsigned 32-bit integer

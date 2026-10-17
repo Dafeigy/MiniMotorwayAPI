@@ -1,21 +1,63 @@
-# Silicon Rider Bench 对 Agent 接口的启示
+# Lessons from Silicon Rider Bench for the Agent API
 
-参考项目：[KCORES/silicon-rider-bench](https://github.com/KCORES/silicon-rider-bench)。以下结论基于其 `src/tools`、`src/core/simulator.ts` 和 `src/client` 的实现；该项目自行控制离散模拟器，而本项目连接持续运行的 Mini Motorways 原生模拟。
+**English** | [简体中文](silicon-rider-lessons.zh-CN.md)
 
-## 值得借鉴的契约
+Reference project: [KCORES/silicon-rider-bench](https://github.com/KCORES/silicon-rider-bench).
+The conclusions below are based on its `src/tools`, `src/core/simulator.ts`, and
+`src/client` implementations. That project owns a discrete simulator; this
+project connects to Mini Motorways' continuously running native simulation.
 
-1. **查询与动作分开。** Silicon Rider 把状态、订单、地图、距离等查询与接单、移动、取餐、等待等修改动作分成两组工具，并通过统一的参数定义和执行器返回结构化成功或错误。本项目继续用 `GET` 读取、`POST` 操作；客户端工具层可以再把 HTTP 端点封装成模型易用的动作定义，但协议仍以游戏实际执行结果为准。
-2. **简要状态常见，详细观测按需读取。** 它在每轮模型请求前更新提示词末尾的简要状态，其他信息由查询工具取得。本项目应让 `/game/status` 和规划中的 `/events` 走轻量读取路径，只在决策边界或需要规划时捕获完整 `/snapshot`。当前 `/game/status` 仍先构建完整快照，不能把它当作低成本轮询端点。
-3. **以模拟边界组织观测和决策。** 它的动作返回时间成本，模拟器据此推进游戏时钟。我们无法替游戏决定每一步的时长，因此应在原生模拟更新结束后确定事件和暂停边界，再捕获同一边界的不可变观测。`snapshotId` 只表示 API 捕获次数；决策与动作记录需要独立的 `episodeId` 和原生模拟时间标识。Agent 思考期间可暂停游戏；无动作决策显式记录 no-op 后继续。
-4. **动作响应与最终效果分开。** 自建模拟器可在工具 handler 中直接更新状态；本项目的 `202 Scheduled` 仅表示游戏命令被排程。必须用 `actionId` 追踪 `queued → scheduled → executed/rejected/expired`，记录实际执行的模拟时间，并从同一或后续边界的观测确认道路、资源和其他状态变化。`GET /requests` 只报告 HTTP／主线程请求结果，不能充当动作最终结果。
-5. **按序执行多动作并明确前置状态。** 参考项目即使模型一次给出多个工具调用，也按序执行。对本项目的道路、设施和周升级，客户端应逐条提交并确认，避免同批动作共享过期的资源或地图判断。可提供轻量合法性查询，但执行时仍须由游戏规则再次验证。
+## Contract patterns worth adopting
 
-## 不能直接照搬的部分
+1. **Separate queries from actions.** Silicon Rider divides state, order, map,
+   and distance queries from accept, move, pickup, and wait mutations. It uses
+   shared parameter definitions and structured success/error responses. This
+   project likewise keeps `GET` reads separate from `POST` operations. A client
+   tool layer can expose model-friendly actions, but native execution remains
+   authoritative.
+2. **Keep a compact status and fetch detailed observations on demand.** The
+   reference refreshes a compact status near the end of every model prompt and
+   obtains other data through query tools. `/game/status` and `/events` should
+   be lightweight polling paths, while full `/snapshot` capture belongs at a
+   decision boundary or planning request. At the time of this comparison,
+   `/game/status` still built a full snapshot and was not a cheap poll.
+3. **Organize observation and decisions around simulation boundaries.** The
+   reference action returns a time cost that advances its simulator. This
+   project cannot choose native step duration, so it must establish events and
+   pause boundaries after native updates, then capture one immutable
+   observation. `snapshotId` is only an API capture sequence; decisions and
+   actions need independent `episodeId` and native-time identity. Pause while
+   the Agent reasons, record no-action decisions explicitly, then resume.
+4. **Separate an action response from its final effect.** A self-owned simulator
+   can mutate state inside a tool handler. Here, `202 Scheduled` means only that
+   the native command was queued. Track `queued → scheduled →
+   executed/rejected/expired` by `actionId`, record actual native execution
+   time, and confirm visible state at the same or a later boundary.
+   `GET /requests` covers HTTP/main-thread processing, not the final action.
+5. **Execute multiple actions in order and state their preconditions.** The
+   reference runs tool calls sequentially even when a model emits several at
+   once. Submit roads, facilities, and weekly upgrades one at a time and confirm
+   each result so they do not share stale resource/map assumptions. A cheap
+   legality query is useful, but native rules must validate again at execution.
 
-- 参考项目的 `wait` handler 已推进时钟，而模拟器又按返回的 `timeCost` 推进一次；本项目应由一个明确位置负责模拟时间，不把 HTTP 调用数或模型轮次当成游戏时间。
-- 参考项目的订单生成部分使用对话轮次及 `Math.random()`，路径效率评分仍有固定值。基准运行应记录游戏版本、地图、模式、seed、事件、动作及模拟时间，并通过真实执行数据计算指标。
-- 浏览器可视化的实时推送是观察者界面，不应代替 Agent 的权威状态读取。状态以游戏主线程捕获的观测和动作执行记录为准。
+## Patterns that do not transfer directly
 
-## 对本项目的实施顺序
+- The reference `wait` handler advances the clock, and its simulator also
+  advances by the returned `timeCost`. This project should have one explicit
+  owner of simulation time and must not equate HTTP calls/model turns with
+  native game time.
+- Parts of the reference's order generation use conversation turns and
+  `Math.random()`, while path-efficiency scoring still contains fixed values.
+  Benchmarks here should record game version, map, mode, seed, events, actions,
+  and native time, then calculate metrics from real execution.
+- Browser live visualization is an observer UI, not an authoritative Agent
+  state source. Authority remains the main-thread observation and native action
+  execution record.
 
-先补齐单项动作的游戏原生编辑路径和周升级选择，再完成动作最终结果、轻量事件及模拟时间边界。各动作需区分参数错误、游戏规则拒绝、无变化、排程成功和最终执行；自动化评测不得把排程成功计为已生效。
+## Recommended implementation order
+
+Complete native single-action edit paths and weekly upgrade selection first,
+then add final action results, lightweight events, and native-time boundaries.
+Each action must distinguish malformed input, native rejection, no change,
+scheduled success, and final execution. Automated evaluation must never count
+scheduled success as an applied change.
