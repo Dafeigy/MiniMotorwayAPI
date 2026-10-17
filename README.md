@@ -309,10 +309,9 @@ agent experiments. It is not yet a deterministic Gym-style environment.
 - [ ] Add lightweight game events and two decision policies: an Agent can poll
   events and pause when needed; an RL model can pause at a configurable minimum
   **simulation-time** interval, with critical events allowed to interrupt it.
-- [ ] Validate the expanded action space in a running game: weekly upgrade
-  selection, traffic lights, roundabouts, and an explicit no-op have been
-  exercised; the revised two-stage motorway edit awaits a game restart.
-  Road edits remain individual.
+- [x] Validate the expanded action space in a running game: weekly upgrade
+  selection, traffic lights, roundabouts, motorways, and an explicit no-op
+  have been exercised. Road edits remain individual.
 - [ ] Add episode and execution identity: `episodeId`, `simulationTick`,
   `actionId`, and a terminal reason.
 - [ ] Expand observations for high-score play with map bounds and terrain,
@@ -352,10 +351,10 @@ the action and observation design behind that plan.
   JSON response and bodyless-POST compatibility are covered by the API smoke
   test options documented above.
 - Weekly upgrade selection, traffic-light and roundabout placement, typed
-  clearing, and no-op were verified in a disposable running game. A first
-  motorway test exposed missing asset consumption; the two-stage fix compiles
-  but still needs a restart and runtime retest. Event-driven decision
-  boundaries are not implemented.
+  clearing, no-op, and the revised two-stage motorway edit were verified in
+  disposable running games. The motorway retest changed the available asset
+  count from 1 to 0 and exposed `hasConsumedUpgrade: true` in the snapshot.
+  Event-driven decision boundaries are not implemented.
 - The game phase is inferred from active UI screens and may be ambiguous during
   transitional loading frames.
 - Vehicle positions, complete lane paths, route costs, and ETA are not in the snapshot.
